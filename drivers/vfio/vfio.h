@@ -108,6 +108,8 @@ void vfio_device_group_unuse_iommu(struct vfio_device *device);
 void vfio_df_group_close(struct vfio_device_file *df);
 struct vfio_group *vfio_group_from_file(struct file *file);
 bool vfio_group_enforced_coherent(struct vfio_group *group);
+int vfio_group_for_each_dev(struct vfio_group *group, void *data,
+			    int (*fn)(struct device *dev, void *data));
 void vfio_group_set_kvm(struct vfio_group *group, struct kvm *kvm);
 bool vfio_device_has_container(struct vfio_device *device);
 int __init vfio_group_init(void);
@@ -169,6 +171,12 @@ static inline struct vfio_group *vfio_group_from_file(struct file *file)
 static inline bool vfio_group_enforced_coherent(struct vfio_group *group)
 {
 	return true;
+}
+
+static inline int vfio_group_for_each_dev(struct vfio_group *group, void *data,
+					  int (*fn)(struct device *dev, void *data))
+{
+	return -EINVAL;
 }
 
 static inline void vfio_group_set_kvm(struct vfio_group *group, struct kvm *kvm)

@@ -34,6 +34,12 @@ int pkvm_host_ept_level(void)
 	return host_ept->cap.level;
 }
 
+struct pkvm_pgtable *pkvm_host_ept_get(void)
+{
+	BUG_ON(!host_ept);
+	return host_ept;
+}
+
 static void *host_ept_zalloc_page(struct pkvm_memcache *mc)
 {
 	void *page = pkvm_alloc_pages(&host_ept_pool, 0);
@@ -536,6 +542,119 @@ void pkvm_flush_host_ept(void)
 
 	ept_sync_context(construct_host_eptp(host_ept));
 }
+
+#ifdef CONFIG_PKVM_INTEL
+struct host_ept_lookup_raw_data {
+	unsigned long vaddr;
+	struct pkvm_host_ept_lookup_result *res;
+};
+
+static int host_ept_lookup_raw_cb(struct pkvm_pgtable_visit_ctx *ctx,
+				  unsigned long walk_flags, void *const arg)
+{
+	struct host_ept_lookup_raw_data *data = arg;
+	struct pkvm_host_ept_lookup_result *res = data->res;
+	const struct pkvm_pgtable_ops *pgt_ops = ctx->pgt->pgt_ops;
+	void *ptep = ctx->ptep;
+	int level = ctx->level;
+	u64 pte = pgt_ops->pte_get(ptep);
+
+	res->raw_pte = pte;
+	res->annotation = 0;
+	res->owner_id = PKVM_ID_HOST;
+	res->level = level;
+	res->hpa = INVALID_PAGE;
+	res->prot = 0;
+
+	if (unlikely(!pgt_ops->pte_is_leaf(ptep, level)))
+		return -EAGAIN;
+
+	if (pgt_ops->pte_present(ptep)) {
+		unsigned long offset = data->vaddr &
+			~pgt_ops->level_to_mask(level);
+
+		res->kind = PKVM_HOST_EPT_LOOKUP_PRESENT;
+		res->hpa = pgt_ops->pte_to_phys(ptep) + offset;
+		res->prot = pgt_ops->pte_to_prot(ptep);
+		return 1;
+	}
+
+	if (pgt_ops->pte_annotated(ptep)) {
+		res->kind = PKVM_HOST_EPT_LOOKUP_ANNOTATED;
+		res->annotation = pte;
+		res->owner_id = pkvm_pte_owner_id(ctx->pgt, ptep);
+		return 1;
+	}
+
+	res->kind = PKVM_HOST_EPT_LOOKUP_EMPTY;
+	return 1;
+}
+
+int pkvm_host_ept_lookup_mmio_annotation_locked(unsigned long vaddr,
+						struct pkvm_host_ept_lookup_result *res)
+{
+	struct host_ept_lookup_raw_data data = {
+		.vaddr = vaddr,
+		.res = res,
+	};
+	struct pkvm_pgtable_walker walker = {
+		.cb = host_ept_lookup_raw_cb,
+		.arg = &data,
+		.walk_flags = PKVM_PGTABLE_WALK_LEAF,
+	};
+	int ret;
+
+	memset(res, 0, sizeof(*res));
+	res->kind = PKVM_HOST_EPT_LOOKUP_EMPTY;
+	res->hpa = INVALID_PAGE;
+	res->owner_id = PKVM_ID_HOST;
+
+	ret = pkvm_pgtable_walk(host_ept, vaddr, PAGE_SIZE, &walker);
+	/* Walk returns 1 when the callback stops the walk (success case). */
+	if (ret == 1)
+		return 0;
+
+	return ret;
+}
+
+int pkvm_host_ept_annotate_mmio_owner(unsigned long hpa, unsigned long size,
+				      enum pkvm_owner_id owner_id)
+{
+	int ret;
+
+	if (owner_id == PKVM_ID_HOST)
+		return -EINVAL;
+
+	pkvm_host_mmu_lock();
+	ret = pkvm_pgtable_set_owner(host_ept, hpa, size, owner_id);
+	if (!ret)
+		pkvm_flush_host_ept();
+	pkvm_host_mmu_unlock();
+
+	return ret;
+}
+
+int pkvm_host_ept_restore_mmio_idmap(unsigned long hpa, unsigned long size,
+				     u64 prot)
+{
+	u64 pte_prot = host_ept->pgt_ops->pte_mk_pgstate(PKVM_PAGE_OWNED) | prot;
+	int ret;
+
+	pkvm_host_mmu_lock();
+	ret = pkvm_pgtable_map(host_ept, hpa, hpa, size, pte_prot, NULL);
+	if (!ret)
+		pkvm_flush_host_ept();
+	pkvm_host_mmu_unlock();
+
+	return ret;
+}
+
+int pkvm_host_ept_unmap(unsigned long vaddr, unsigned long phys,
+			unsigned long size)
+{
+	return pkvm_pgtable_unmap(host_ept, vaddr, phys, size);
+}
+#endif
 
 void pkvm_guest_ept_setup(void)
 {

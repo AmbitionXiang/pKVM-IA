@@ -1707,6 +1707,23 @@ static inline bool kvm_arch_has_noncoherent_dma(struct kvm *kvm)
 }
 #endif
 
+#ifdef CONFIG_PKVM_X86
+int kvm_arch_add_device_to_pkvm(struct kvm *kvm, struct file *file);
+int kvm_arch_remove_device_from_pkvm(struct kvm *kvm, struct file *file);
+#else
+static inline int kvm_arch_add_device_to_pkvm(struct kvm *kvm,
+					      struct file *file)
+{
+	return 0;
+}
+
+static inline int kvm_arch_remove_device_from_pkvm(struct kvm *kvm,
+						   struct file *file)
+{
+	return 0;
+}
+#endif
+
 static inline struct rcuwait *kvm_arch_vcpu_get_wait(struct kvm_vcpu *vcpu)
 {
 #ifdef __KVM_HAVE_ARCH_WQP

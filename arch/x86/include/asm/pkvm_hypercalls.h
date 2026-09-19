@@ -107,6 +107,13 @@ PKVM_HC(iommu_domain_unmap)
 PKVM_HC_IN(iommu_modify_irte)
 #endif
 
+/* ptdev hypercalls */
+#ifdef CONFIG_PKVM_INTEL
+PKVM_HC(add_ptdev)
+PKVM_HC(remove_ptdev)
+PKVM_HC(sync_ptdev_mmio_metadata)
+#endif
+
 #undef PKVM_HC
 #undef PKVM_HC_OUT
 #undef PKVM_HC_IN

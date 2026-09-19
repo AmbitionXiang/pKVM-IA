@@ -67,6 +67,16 @@ struct pkvm_vm {
 	struct pkvm_pgtable mmu;
 	struct pkvm_pool mmu_pool;
 	pkvm_spinlock_t mmu_lock;
+#ifdef CONFIG_PKVM_INTEL
+	/* Linked list of passthrough devices assigned to this VM */
+	struct list_head ptdev_head;
+	/* MMIO allowlist for guest */
+	u16 mmio_allow_nr_ranges;
+	u16 mmio_allow_generation;
+	u32 mmio_allow_flags;
+	struct pkvm_guest_mmio_allow_range
+		mmio_allow_ranges[PKVM_GUEST_MMIO_ALLOW_MAX_RANGES];
+#endif
 	/*
 	 * The struct kvm should be the last element. In cases where struct kvm
 	 * is wrapped by a vendor specific structure, putting it as the last

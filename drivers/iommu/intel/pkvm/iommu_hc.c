@@ -11,6 +11,7 @@
 #include "pkvm/memory.h"
 #include "pkvm/pkvm.h"
 #include "pkvm/debug.h"
+#include "pkvm/ptdev.h"
 #include "../iommu.h"
 #include "../pasid.h"
 
@@ -40,6 +41,9 @@ int pkvm_iommu_clear_ce(struct clear_ce_data *data)
 
 	if (data->ats_qdep > PCI_ATS_MAX_QDEP)
 		return -EINVAL;
+
+	if (!pkvm_is_boot_ptdev(PCI_DEVID(data->bus, data->devfn)))
+		return -EPERM;
 
 	info.iommu = iommu;
 	info.bus = data->bus;
@@ -95,8 +99,10 @@ static int iommu_set_lm_ce(struct set_lm_ce_data *data)
 
 	if (data->ats_qdep > PCI_ATS_MAX_QDEP)
 		return -EINVAL;
-
 	if (data->ats_supported && !is_dev_in_satc(bdf))
+		return -EPERM;
+
+	if (!pkvm_is_boot_ptdev(bdf))
 		return -EPERM;
 
 	info.bus = data->bus;
@@ -127,6 +133,7 @@ static int iommu_set_lm_ce(struct set_lm_ce_data *data)
 	pkvm_dbg("%s: dev[%x:%x], did: %d, pgd: %p, agaw: %d\n", __func__,
 		 data->bus, data->devfn, data->did, domain->pgd,
 		 domain->agaw);
+
 	ret = domain_context_mapping_one(domain, iommu, &info, data->did,
 					 data->bus, data->devfn);
 	if (ret) {
@@ -179,6 +186,9 @@ static int iommu_set_sm_ce(struct set_sm_ce_data *data)
 		return -EINVAL;
 
 	if (data->ats_supported && !is_dev_in_satc(bdf))
+		return -EPERM;
+
+	if (!pkvm_is_boot_ptdev(bdf))
 		return -EPERM;
 
 	info.bus = data->bus;
@@ -262,6 +272,9 @@ static int iommu_pasid_setup_fl(struct pasid_setup_fl_data *data)
 		return -EINVAL;
 	}
 
+	if (!pkvm_is_boot_ptdev(PCI_DEVID(data->bus, data->devfn)))
+		return -EPERM;
+
 	info.bus = data->bus;
 	info.devfn = data->devfn;
 	info.ats_qdep = data->ats_qdep;
@@ -337,6 +350,9 @@ static int iommu_pasid_setup_sl(struct pasid_setup_sl_data *data)
 	if (data->ats_qdep > PCI_ATS_MAX_QDEP)
 		return -EINVAL;
 
+	if (!pkvm_is_boot_ptdev(PCI_DEVID(data->bus, data->devfn)))
+		return -EPERM;
+
 	info.bus = data->bus;
 	info.devfn = data->devfn;
 	info.iommu = iommu;
@@ -393,6 +409,9 @@ int pkvm_iommu_pasid_teardown(struct pasid_teardown_data *data)
 
 	if (data->ats_qdep > PCI_ATS_MAX_QDEP)
 		return -EINVAL;
+
+	if (!pkvm_is_boot_ptdev(PCI_DEVID(data->bus, data->devfn)))
+		return -EPERM;
 
 	info.bus = data->bus;
 	info.devfn = data->devfn;

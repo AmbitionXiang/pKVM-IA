@@ -4,6 +4,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/extable.h>
+#include <linux/pci.h>
 #include <asm/e820/api.h>
 #include <asm/pkvm_image.h>
 #include <asm/setup.h>
@@ -11,6 +12,7 @@
 #include "pkvm_constants.h"
 #include "vmx.h"
 #include "pkvm_iommu.h"
+#include "iommu.h"
 
 extern u64 x86_pred_cmd;
 
@@ -1409,6 +1411,46 @@ static int __init pkvm_firmware_rmem_clear(void)
 	return 0;
 }
 
+static int __init build_boot_ptdev_manifest(struct pkvm_hyp *pkvm)
+{
+	struct pci_dev *pdev = NULL;
+	struct dmar_drhd_unit *drhd;
+	int cnt = 0;
+
+	memset(pkvm->boot_ptdev_manifest, 0, sizeof(pkvm->boot_ptdev_manifest));
+	pkvm->boot_ptdev_cnt = 0;
+
+	for_each_pci_dev(pdev) {
+		struct pkvm_boot_ptdev_manifest_entry *entry;
+		int bar;
+
+		if (cnt == PKVM_MAX_BOOT_PTDEV_NUM) {
+			pr_err("pkvm: too many boot ptdevs to be tracked\n");
+			return -EINVAL;
+		}
+
+		entry = &pkvm->boot_ptdev_manifest[cnt++];
+		entry->bdf = pci_dev_id(pdev);
+		entry->flags = 0;
+		memset(entry->bars, 0, sizeof(entry->bars));
+
+		drhd = dmar_find_matched_drhd_unit(pdev);
+		if (drhd && !sm_supported(drhd->iommu))
+			entry->flags |= PKVM_BOOT_PTDEV_FLAG_HOST_IOMMU_LEGACY;
+
+		for (bar = 0; bar < PCI_STD_NUM_BARS; bar++) {
+			if (!(pci_resource_flags(pdev, bar) & IORESOURCE_MEM))
+				continue;
+
+			entry->bars[bar].base = pci_resource_start(pdev, bar);
+			entry->bars[bar].size = pci_resource_len(pdev, bar);
+		}
+	}
+
+	pkvm->boot_ptdev_cnt = cnt;
+	return 0;
+}
+
 int __init vmx_pkvm_init(void)
 {
 	struct pkvm_hyp *pkvm;
@@ -1492,6 +1534,10 @@ int __init vmx_pkvm_init(void)
 	}
 
 	ret = pkvm_host_prepare_iommu();
+	if (ret)
+		goto out;
+
+	ret = build_boot_ptdev_manifest(pkvm);
 	if (ret)
 		goto out;
 

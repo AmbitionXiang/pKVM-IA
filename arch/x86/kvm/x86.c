@@ -89,6 +89,9 @@
 #ifdef __PKVM_HYP__
 #include "pkvm.h"
 #include "pkvm/mmu.h"
+#if IS_ENABLED(CONFIG_PKVM_INTEL)
+#include "pkvm/ptdev.h"
+#endif
 
 #undef module_param_named
 #define module_param_named(...)
@@ -15138,6 +15141,14 @@ int pkvm_emulate_hypercall(struct kvm_vcpu *vcpu)
 			return 0;
 		}
 		break;
+#if IS_ENABLED(CONFIG_PKVM_INTEL)
+	case PKVM_GHC_PTDEV_MMIO_INFO:
+		ret = pkvm_handle_ptdev_mmio_info(vcpu, a0, a1);
+		break;
+	case PKVM_GHC_PTDEV_MMIO_READ:
+		ret = pkvm_handle_ptdev_mmio_read(vcpu, a0, a1, a2);
+		break;
+#endif
 	default:
 		/* Other hypercalls are not supported */
 		break;

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 
 #include <linux/kvm_para.h>
+#include <linux/io.h>
 #include <asm/coco.h>
 #include <asm/pkvm_guest.h>
 #include <asm/pgtable.h>
@@ -8,6 +9,11 @@
 
 DEFINE_STATIC_KEY_FALSE(pkvm_guest_detected);
 EXPORT_SYMBOL(pkvm_guest_detected);
+
+static struct pkvm_guest_mmio_info pkvm_mmio_info;
+static struct pkvm_guest_mmio_allow_range
+	pkvm_mmio_allow_ranges[PKVM_GUEST_MMIO_ALLOW_MAX_RANGES];
+static u16 pkvm_mmio_allow_nr_ranges;
 
 int pkvm_set_mem_host_visibility(unsigned long addr, int numpages, bool enc)
 {
@@ -43,6 +49,110 @@ int pkvm_set_mem_host_visibility(unsigned long addr, int numpages, bool enc)
 	return ret;
 }
 
+static bool pkvm_mmio_allow_hit(unsigned long gpa, int size)
+{
+	u64 access_end = (u64)gpa + size;
+	u16 i;
+
+	if (access_end < gpa)
+		return false;
+
+	for (i = 0; i < pkvm_mmio_allow_nr_ranges; i++) {
+		struct pkvm_guest_mmio_allow_range *range =
+			&pkvm_mmio_allow_ranges[i];
+		u64 range_end = range->guest_gpa + range->size;
+
+		if (range_end < range->guest_gpa)
+			continue;
+
+		if (!(range->flags & PKVM_GUEST_MMIO_ALLOW_FLAG_DIRECT_BAR))
+			continue;
+
+		if (gpa >= range->guest_gpa && access_end <= range_end)
+			return true;
+	}
+
+	return false;
+}
+
+static bool pkvm_direct_mmio_write(int size, unsigned long vaddr,
+				   unsigned long val)
+{
+	switch (size) {
+	case 1:
+		raw_writeb(val, (void __iomem *)vaddr);
+		return true;
+	case 2:
+		raw_writew(val, (void __iomem *)vaddr);
+		return true;
+	case 4:
+		raw_writel(val, (void __iomem *)vaddr);
+		return true;
+#ifdef CONFIG_X86_64
+	case 8:
+		raw_writeq(val, (void __iomem *)vaddr);
+		return true;
+#endif
+	default:
+		return false;
+	}
+}
+
+static bool pkvm_direct_mmio_read(int size, unsigned long vaddr,
+				  unsigned long *val)
+{
+	switch (size) {
+	case 1:
+		*val = raw_readb((void __iomem *)vaddr);
+		return true;
+	case 2:
+		*val = raw_readw((void __iomem *)vaddr);
+		return true;
+	case 4:
+		*val = raw_readl((void __iomem *)vaddr);
+		return true;
+#ifdef CONFIG_X86_64
+	case 8:
+		*val = raw_readq((void __iomem *)vaddr);
+		return true;
+#endif
+	default:
+		return false;
+	}
+}
+
+static void pkvm_init_mmio_allowlist(void)
+{
+	long ret;
+
+	memset(&pkvm_mmio_info, 0, sizeof(pkvm_mmio_info));
+	memset(pkvm_mmio_allow_ranges, 0, sizeof(pkvm_mmio_allow_ranges));
+	pkvm_mmio_allow_nr_ranges = 0;
+
+	ret = kvm_hypercall2(PKVM_GHC_PTDEV_MMIO_INFO, __pa(&pkvm_mmio_info),
+			     sizeof(pkvm_mmio_info));
+	if (ret)
+		return;
+
+	if (pkvm_mmio_info.nr_ranges > ARRAY_SIZE(pkvm_mmio_allow_ranges)) {
+		memset(&pkvm_mmio_info, 0, sizeof(pkvm_mmio_info));
+		return;
+	}
+
+	pkvm_mmio_allow_nr_ranges = pkvm_mmio_info.nr_ranges;
+	if (!pkvm_mmio_allow_nr_ranges)
+		return;
+
+	ret = kvm_hypercall3(PKVM_GHC_PTDEV_MMIO_READ,
+			     __pa(pkvm_mmio_allow_ranges),
+			     pkvm_mmio_allow_nr_ranges, 0);
+	if (ret) {
+		memset(&pkvm_mmio_info, 0, sizeof(pkvm_mmio_info));
+		memset(pkvm_mmio_allow_ranges, 0, sizeof(pkvm_mmio_allow_ranges));
+		pkvm_mmio_allow_nr_ranges = 0;
+	}
+}
+
 static int pkvm_virt_mmio(int size, bool write, unsigned long vaddr, unsigned long *val)
 {
 	unsigned long paddr;
@@ -54,6 +164,10 @@ static int pkvm_virt_mmio(int size, bool write, unsigned long vaddr, unsigned lo
 		return -EIO;
 
 	paddr = (pte_pfn(*pte) << PAGE_SHIFT) | (vaddr & ~page_level_mask(level));
+
+	if (pkvm_mmio_allow_hit(paddr, size))
+		return write ? pkvm_direct_mmio_write(size, vaddr, *val) :
+			       pkvm_direct_mmio_read(size, vaddr, val);
 
 	if (write)
 		kvm_hypercall3(PKVM_GHC_IOWRITE, paddr, size, *val);
@@ -137,6 +251,8 @@ __init void pkvm_guest_init_coco(void)
 	cc_vendor = CC_VENDOR_PKVM;
 
 	static_branch_enable(&pkvm_guest_detected);
+
+	pkvm_init_mmio_allowlist();
 
 	pv_ops.mmio.raw_readb = pkvm_mmio_readb;
 	pv_ops.mmio.raw_readw = pkvm_mmio_readw;

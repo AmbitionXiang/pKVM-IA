@@ -795,6 +795,18 @@ struct pkvm_memcache {
 	unsigned long flags;
 };
 
+#ifdef CONFIG_PKVM_INTEL
+struct kvm_ptdev_mmio_metadata {
+	u16 segment;
+	u16 bdf;
+	u16 nr_ranges;
+	u16 generation;
+	u32 flags;
+	struct kvm_protected_vm_ptdev_mmio_range
+		ranges[KVM_PROTECTED_VM_PTDEV_MMIO_MAX_RANGES];
+};
+#endif
+
 struct kvm_pkvm_vm {
 	int handle;
 	struct pkvm_memcache guest_mmu_teardown_mc;
@@ -803,6 +815,10 @@ struct kvm_pkvm_vm {
 	gpa_t pvmfw_load_addr;
 	bool finalized;
 	struct mutex finalized_lock;
+#ifdef CONFIG_PKVM_INTEL
+	bool ptdev_mmio_metadata_valid;
+	struct kvm_ptdev_mmio_metadata ptdev_mmio_metadata;
+#endif
 };
 
 struct kvm_pkvm_vcpu {

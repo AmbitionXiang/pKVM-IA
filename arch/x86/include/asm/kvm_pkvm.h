@@ -18,6 +18,28 @@
 #define PKVM_STACK_TOP_RESV		16
 #define PKVM_PGTABLE_MAX_LEVELS		5
 
+#ifdef CONFIG_PKVM_INTEL
+#include <linux/pci_regs.h>
+
+#define PKVM_MAX_PASID_PDEV_NUM		32
+#define PKVM_MAX_PDEV_NUM		512
+#define PKVM_MAX_BOOT_PTDEV_NUM		(PKVM_MAX_PDEV_NUM + PKVM_MAX_PASID_PDEV_NUM)
+#define PKVM_MAX_DEVS_IN_SATC		16
+
+#define PKVM_BOOT_PTDEV_FLAG_HOST_IOMMU_LEGACY	0x1
+
+struct pkvm_boot_ptdev_bar_entry {
+	u64 base;
+	u64 size;
+};
+
+struct pkvm_boot_ptdev_manifest_entry {
+	u16 bdf;
+	u16 flags;
+	struct pkvm_boot_ptdev_bar_entry bars[PCI_STD_NUM_BARS];
+};
+#endif
+
 struct idt_page {
 	gate_desc idt[IDT_ENTRIES];
 } __aligned(PAGE_SIZE);
@@ -37,6 +59,15 @@ struct pkvm_hyp {
 	struct pkvm_pcpu *pcpus[CONFIG_NR_CPUS];
 	struct kvm *host_kvm;
 	struct kvm_vcpu *host_vcpus[CONFIG_NR_CPUS];
+#ifdef CONFIG_PKVM_INTEL
+	/* Boot ptdev manifest */
+	u16 boot_ptdev_cnt;
+	struct pkvm_boot_ptdev_manifest_entry
+		boot_ptdev_manifest[PKVM_MAX_BOOT_PTDEV_NUM];
+	/* SATC device BDF list */
+	u16 satc_dev_bdf[PKVM_MAX_DEVS_IN_SATC];
+	int satc_dev_cnt;
+#endif
 };
 
 #define PKVM_HYP_PAGES		(PAGE_ALIGN(sizeof(struct pkvm_hyp)) >> PAGE_SHIFT)

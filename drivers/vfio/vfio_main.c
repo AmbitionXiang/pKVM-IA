@@ -1396,6 +1396,37 @@ static struct vfio_device *vfio_device_from_file(struct file *file)
 }
 
 /**
+ * vfio_file_apply_to_all - Apply a callback to device(s) behind a VFIO file
+ * @file: VFIO group file or VFIO device file
+ * @data: Opaque pointer passed to @fn
+ * @fn: Callback invoked for each device. Return non-zero to abort iteration
+ *      and propagate the return value to the caller.
+ *
+ * For a group file, iterates over all devices in the group and invokes @fn
+ * for each. For a device file (cdev mode), invokes @fn once for that single
+ * device. Returns 0 if all callbacks returned 0, or the non-zero return
+ * value from the first failing callback otherwise. Returns -EINVAL if @file
+ * is neither a group file nor a device file.
+ */
+int vfio_file_apply_to_all(struct file *file, void *data,
+			   int (*fn)(struct device *dev, void *data))
+{
+	struct vfio_group *group;
+	struct vfio_device *device;
+
+	group = vfio_group_from_file(file);
+	if (group)
+		return vfio_group_for_each_dev(group, data, fn);
+
+	device = vfio_device_from_file(file);
+	if (device)
+		return fn(device->dev, data);
+
+	return -EINVAL;
+}
+EXPORT_SYMBOL_GPL(vfio_file_apply_to_all);
+
+/**
  * vfio_file_is_valid - True if the file is valid vfio file
  * @file: VFIO group file or VFIO device file
  */

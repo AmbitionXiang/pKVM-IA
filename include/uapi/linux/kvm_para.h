@@ -2,6 +2,8 @@
 #ifndef _UAPI__LINUX_KVM_PARA_H
 #define _UAPI__LINUX_KVM_PARA_H
 
+#include <linux/types.h>
+
 /*
  * This header file provides a method for making a hypercall to the host
  * Architectures should define:
@@ -40,6 +42,24 @@
 #define PKVM_GHC_IOREAD			PKVM_GHC_NUM(3)
 #define PKVM_GHC_IOWRITE		PKVM_GHC_NUM(4)
 #define PKVM_GHC_START_CPU		PKVM_GHC_NUM(5)
+#define PKVM_GHC_PTDEV_MMIO_INFO	PKVM_GHC_NUM(6)
+#define PKVM_GHC_PTDEV_MMIO_READ	PKVM_GHC_NUM(7)
+
+#define PKVM_GUEST_MMIO_ALLOW_MAX_RANGES	16
+#define PKVM_GUEST_MMIO_ALLOW_FLAG_DIRECT_BAR	(1U << 0)
+
+struct pkvm_guest_mmio_info {
+	__u16 nr_ranges;
+	__u16 generation;
+	__u32 flags;
+};
+
+struct pkvm_guest_mmio_allow_range {
+	__u64 guest_gpa;
+	__u64 size;
+	__u32 flags;
+	__u32 __reserved;
+};
 
 /*
  * hypercalls use architecture specific

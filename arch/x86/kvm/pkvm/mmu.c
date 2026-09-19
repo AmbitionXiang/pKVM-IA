@@ -7,6 +7,7 @@
 #include "mmu.h"
 #include "pgtable.h"
 #include "pkvm.h"
+#include "ptdev.h"
 
 static struct pkvm_pgtable hyp_mmu;
 static struct pkvm_pool hyp_mmu_pool;
@@ -431,7 +432,8 @@ static void pkvm_guest_mmu_unlock(struct pkvm_vm *vm)
 }
 
 static u64 guest_mmu_pte_prot(struct kvm_vcpu *vcpu, unsigned long gpa,
-			      bool writable, enum pkvm_page_state state)
+			      bool writable, enum pkvm_page_state state,
+			      bool direct_mmio)
 {
 	struct pkvm_vm *pkvm_vm = to_pkvm_vcpu(vcpu)->pkvm_vm;
 	u64 prot;
@@ -440,7 +442,7 @@ static u64 guest_mmu_pte_prot(struct kvm_vcpu *vcpu, unsigned long gpa,
 	prot |= pkvm_vm->mmu.pgt_ops->pte_mk_pgstate(state);
 
 	/* memory type bits */
-	prot |= kvm_x86_call(get_mt_mask)(vcpu, gpa >> PAGE_SHIFT, false);
+	prot |= kvm_x86_call(get_mt_mask)(vcpu, gpa >> PAGE_SHIFT, direct_mmio);
 
 	return prot;
 }
@@ -1380,6 +1382,50 @@ out:
 }
 
 /**
+ * pkvm_host_map_guest_mmio() - Map an MMIO region into the guest mmu.
+ * @vcpu:	Guest's vCPU in whose context the mapping is requested.
+ * @gpa:	Guest physical address of the MMIO region to map.
+ * @hpa:	Host physical address of the MMIO region to map.
+ * @size:	Size of the MMIO region to map.
+ *
+ * Maps the GPA range [@gpa, @gpa + @size) to the physical MMIO range
+ * [@hpa, @hpa + @size) in the guest mmu without changing the ownership state
+ * of any pages. This is used for passthrough device BAR MMIO regions that have
+ * been annotated with PKVM_ID_PTDEV_MMIO in the host EPT and attached to the
+ * guest. The guest must be a protected VM. The @gpa, @hpa and @size are
+ * required to be PAGE_SIZE aligned.
+ *
+ * Returns: 0 on success, or a negative error code on failure.
+ */
+int pkvm_host_map_guest_mmio(struct kvm_vcpu *vcpu, unsigned long gpa,
+			     unsigned long hpa, unsigned long size)
+{
+	u64 prot = guest_mmu_pte_prot(vcpu, gpa, true, PKVM_PAGE_OWNED, true);
+	struct pkvm_vm *pkvm_vm = to_pkvm_vcpu(vcpu)->pkvm_vm;
+	int ret;
+
+	if (!is_valid_addr_range(gpa, size, true) ||
+	    !is_valid_addr_range(hpa, size, true))
+		return -EINVAL;
+
+	if (WARN_ON_ONCE(!pkvm_is_protected_vcpu(vcpu)))
+		return -EPERM;
+
+	pkvm_guest_mmu_lock(pkvm_vm);
+
+	ret = check_page_state(&pkvm_vm->mmu, gpa, size, PKVM_PAGE_NONE);
+	if (ret)
+		goto unlock;
+
+	ret = pkvm_pgtable_map(&pkvm_vm->mmu, gpa, hpa, size, prot,
+			       &vcpu->arch.pkvm.guest_mmu_memcache);
+unlock:
+	pkvm_guest_mmu_unlock(pkvm_vm);
+
+	return ret;
+}
+
+/**
  * pkvm_host_donate_guest() - Donate memory pages from host to guest.
  * @vcpu:	Guest's vCPU in whose context the donation is requested.
  * @gpa:	Guest physical address of the memory region to donate.
@@ -1401,7 +1447,7 @@ out:
 int pkvm_host_donate_guest(struct kvm_vcpu *vcpu, unsigned long gpa,
 			   unsigned long hpa, unsigned long size)
 {
-	u64 prot = guest_mmu_pte_prot(vcpu, gpa, true, PKVM_PAGE_OWNED);
+	u64 prot = guest_mmu_pte_prot(vcpu, gpa, true, PKVM_PAGE_OWNED, false);
 	struct pkvm_vm *pkvm_vm = to_pkvm_vcpu(vcpu)->pkvm_vm;
 	unsigned long gpa_offset, pvmfw_offset, load_size;
 	int ret;
@@ -1491,7 +1537,7 @@ int pkvm_host_share_guest(struct kvm_vcpu *vcpu, unsigned long gpa,
 			  bool writable)
 {
 	u64 prot = guest_mmu_pte_prot(vcpu, gpa, writable,
-				      PKVM_PAGE_SHARED_BORROWED);
+				      PKVM_PAGE_SHARED_BORROWED, false);
 	struct pkvm_vm *pkvm_vm = to_pkvm_vcpu(vcpu)->pkvm_vm;
 	int ret;
 

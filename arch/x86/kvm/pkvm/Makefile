@@ -48,6 +48,7 @@ pkvm-hyp-$(CONFIG_PKVM_INTEL)	+= vmx/host_vmentry.o vmx/host_vmx.o \
 				   $(kvm)/vmx/vmx.o vmx/idt.o vmx/ept.o \
 				   vmx/host_repriv.o $(kvm)/vmx/main.o \
 				   $(kvm)/vmx/vmenter.o
+pkvm-hyp-$(CONFIG_PKVM_INTEL)	+= ptdev.o
 
 AFLAGS_$(kvm)/vmx/vmenter.pkvm.o += -iquote $(obj)
 $(obj)/$(kvm)/vmx/vmenter.pkvm.o: $(obj)/kvm-asm-offsets.h

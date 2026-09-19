@@ -12,6 +12,7 @@
 #include "panic.h"
 #include "pkvm.h"
 #include "trace.h"
+#include "ptdev.h"
 #include "../x86.h"
 #include "../lapic.h"
 #include "pkvm_iommu.h"
@@ -172,6 +173,7 @@ static int pkvm_vm_init(phys_addr_t host_kvm_pa, phys_addr_t pkvm_vm_pa,
 	kvm->arch.pkvm.pvmfw_load_addr = INVALID_GPA;
 
 	pkvm_spin_lock_init(&pkvm_vm->lock);
+	INIT_LIST_HEAD(&pkvm_vm->ptdev_head);
 
 	ret = pkvm_guest_mmu_init(pkvm_vm, pgd_pa);
 	if (ret)
@@ -235,6 +237,10 @@ static int pkvm_vm_destroy(int vm_handle, struct pkvm_memcache *mc)
 		__pkvm_vcpu_free(pkvm_vm, i, mc);
 
 	shared_kvm_pa = __pkvm_pa(pkvm_vm->shared_kvm);
+
+#ifdef CONFIG_PKVM_INTEL
+	pkvm_vm_destroy_ptdevs(pkvm_vm);
+#endif
 
 	kvm_x86_call(vm_destroy)(&pkvm_vm->kvm);
 
@@ -1804,6 +1810,7 @@ static int pkvm_vm_mmu_map(unsigned long gpa, unsigned long hpa,
 			   unsigned long size, bool writable)
 {
 	struct kvm_vcpu *vcpu = this_cpu_read(cur_guest_vcpu);
+	struct kvm *kvm;
 	int ret;
 
 	if (!vcpu)
@@ -1813,11 +1820,21 @@ static int pkvm_vm_mmu_map(unsigned long gpa, unsigned long hpa,
 	if (ret)
 		return ret;
 
+	kvm = vcpu->kvm;
+
 	if (pkvm_is_protected_vcpu(vcpu)) {
 		if (!writable)
 			return -EPERM;
 
-		ret = pkvm_host_donate_guest(vcpu, gpa, hpa, size);
+		if (pkvm_vm_hpa_hits_attached_boot_ptdev_bar(kvm, hpa, size)) {
+			ret = pkvm_host_map_guest_mmio(vcpu, gpa, hpa, size);
+		} else if (pkvm_host_hpa_hits_boot_ptdev_bar(hpa, size)) {
+			pkvm_err("pkvm: vm_mmu_map: reject boot ptdev BAR HPA not attached to VM gpa=0x%lx hpa=0x%lx size=0x%lx\n",
+				 gpa, hpa, size);
+			ret = -EPERM;
+		} else {
+			ret = pkvm_host_donate_guest(vcpu, gpa, hpa, size);
+		}
 	} else {
 		ret = pkvm_host_share_guest(vcpu, gpa, hpa, size, writable);
 	}
@@ -2063,6 +2080,73 @@ static int pkvm_vcpu_handle_host_hypercall(struct kvm_vcpu *hvcpu, enum pkvm_hc 
 	return ret;
 }
 
+#ifdef CONFIG_PKVM_INTEL
+static int pkvm_hc_add_ptdev(int vm_handle, u16 bdf)
+{
+	struct pkvm_vm *pkvm_vm;
+	int ret;
+
+	pkvm_vm = pkvm_get_vm(vm_handle);
+	if (!pkvm_vm)
+		return -EINVAL;
+
+	if (pkvm_is_protected_vm(&pkvm_vm->kvm))
+		ret = pkvm_attach_ptdev(bdf, pkvm_vm);
+	else
+		ret = -EINVAL;
+
+	pkvm_put_vm(pkvm_vm);
+	return ret;
+}
+
+static int pkvm_hc_remove_ptdev(int vm_handle, u16 bdf)
+{
+	struct pkvm_vm *pkvm_vm;
+	int ret;
+
+	pkvm_vm = pkvm_get_vm(vm_handle);
+	if (!pkvm_vm)
+		return -EINVAL;
+
+	if (pkvm_is_protected_vm(&pkvm_vm->kvm))
+		ret = pkvm_remove_ptdev(bdf, pkvm_vm);
+	else
+		ret = -EINVAL;
+
+	pkvm_put_vm(pkvm_vm);
+	return ret;
+}
+
+static int pkvm_hc_sync_ptdev_mmio_metadata(int vm_handle)
+{
+	struct pkvm_vm *pkvm_vm;
+	struct kvm *shared_kvm;
+	int ret;
+
+	pkvm_vm = pkvm_get_vm(vm_handle);
+	if (!pkvm_vm)
+		return -EINVAL;
+
+	shared_kvm = pkvm_vm->shared_kvm;
+
+	if (!pkvm_is_protected_vm(&pkvm_vm->kvm)) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	if (!shared_kvm->arch.pkvm.ptdev_mmio_metadata_valid) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	ret = pkvm_set_ptdev_mmio_metadata(pkvm_vm,
+					   &shared_kvm->arch.pkvm.ptdev_mmio_metadata);
+out:
+	pkvm_put_vm(pkvm_vm);
+	return ret;
+}
+#endif
+
 void pkvm_handle_host_hypercall(struct kvm_vcpu *vcpu)
 {
 	enum pkvm_hc hc = pkvm_hc(vcpu);
@@ -2203,6 +2287,19 @@ void pkvm_handle_host_hypercall(struct kvm_vcpu *vcpu)
 		break;
 	case __pkvm__iommu_modify_irte:
 		ret = pkvm_iommu_modify_irte(&in.iommu_modify_irte.data);
+		break;
+#endif
+#ifdef CONFIG_PKVM_INTEL
+	case __pkvm__add_ptdev:
+		ret = pkvm_hc_add_ptdev(pkvm_hc_input1(vcpu),
+					(u16)pkvm_hc_input2(vcpu));
+		break;
+	case __pkvm__remove_ptdev:
+		ret = pkvm_hc_remove_ptdev(pkvm_hc_input1(vcpu),
+					   (u16)pkvm_hc_input2(vcpu));
+		break;
+	case __pkvm__sync_ptdev_mmio_metadata:
+		ret = pkvm_hc_sync_ptdev_mmio_metadata(pkvm_hc_input1(vcpu));
 		break;
 #endif
 	default:

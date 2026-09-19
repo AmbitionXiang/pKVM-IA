@@ -975,10 +975,35 @@ struct kvm_hyperv_eventfd {
 /* Protected KVM */
 #define KVM_CAP_X86_PROTECTED_VM_FLAGS_SET_FW_GPA	0
 #define KVM_CAP_X86_PROTECTED_VM_FLAGS_INFO		1
+#define KVM_CAP_X86_PROTECTED_VM_FLAGS_SET_PTDEV_MMIO_METADATA 2
+
+#define KVM_PROTECTED_VM_PTDEV_MMIO_MAX_RANGES		16
+
+#define KVM_PROTECTED_VM_PTDEV_MMIO_KIND_DIRECT_BAR	1
 
 struct kvm_protected_vm_info {
 	__u64 firmware_size;
 	__u64 __reserved[7];
+};
+
+struct kvm_protected_vm_ptdev_mmio_range {
+	__u64 guest_gpa;
+	__u64 size;
+	__u64 bar_offset;
+	__u8 bar_index;
+	__u8 kind;
+	__u16 __reserved16;
+	__u32 __reserved32;
+};
+
+struct kvm_protected_vm_ptdev_mmio_metadata {
+	__u16 segment;
+	__u16 bdf;
+	__u16 nr_ranges;
+	__u16 generation;
+	__u32 flags;
+	__u64 ranges;
+	__u64 __reserved[4];
 };
 
 /* Trust Domain eXtension sub-ioctl() commands. */

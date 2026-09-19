@@ -63,6 +63,7 @@ enum pkvm_page_state {
  * @PKVM_ID_HOST:	Host VM.
  * @PKVM_ID_HYP:	pKVM hypervisor.
  * @PKVM_ID_GUEST:	(Any) guest VM.
+ * @PKVM_ID_PTDEV_MMIO:	Passthrough device MMIO space.
  *
  * The owner ID is used to indicate the page owner. It is saved in the host
  * MMU non-present leaf entry.
@@ -71,6 +72,7 @@ enum pkvm_owner_id {
 	PKVM_ID_HOST,
 	PKVM_ID_HYP,
 	PKVM_ID_GUEST,
+	PKVM_ID_PTDEV_MMIO,
 	PKVM_MAX_ID,
 };
 
@@ -86,6 +88,8 @@ int pkvm_host_share_hyp(unsigned long phys, unsigned long size);
 void pkvm_host_unshare_hyp(unsigned long phys, unsigned long size);
 int pkvm_host_donate_guest(struct kvm_vcpu *vcpu, unsigned long gpa,
 			   unsigned long hpa, unsigned long size);
+int pkvm_host_map_guest_mmio(struct kvm_vcpu *vcpu, unsigned long gpa,
+			     unsigned long hpa, unsigned long size);
 int pkvm_host_share_guest(struct kvm_vcpu *vcpu, unsigned long gpa,
 			  unsigned long hpa, unsigned long size,
 			  bool writable);
