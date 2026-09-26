@@ -1734,8 +1734,11 @@ static int pkvm_vcpu_run(struct kvm_vcpu *vcpu, bool force_immediate_exit,
 		 * bsp_vcpu_id and sipi_vector are read after reading mp_state,
 		 * so they are read with up-to-date values.
 		 */
-		if (smp_load_acquire(&vcpu->arch.mp_state) != KVM_MP_STATE_RUNNABLE)
+		if (smp_load_acquire(&vcpu->arch.mp_state) != KVM_MP_STATE_RUNNABLE) {
+			pkvm_err("pkvm: vcpu_run EPERM mp_state=%d vcpu_id=%d\n",
+				 vcpu->arch.mp_state, vcpu->vcpu_id);
 			return -EPERM;
+		}
 
 		if (unlikely(!kvm_vcpu_has_run(vcpu))) {
 			if (pkvm_vcpu_is_pvmfw_bsp(vcpu))
@@ -1823,10 +1826,15 @@ static int pkvm_vm_mmu_map(unsigned long gpa, unsigned long hpa,
 	kvm = vcpu->kvm;
 
 	if (pkvm_is_protected_vcpu(vcpu)) {
-		if (!writable)
+		if (!writable) {
+			pkvm_err("pkvm: vm_mmu_map: EPERM !writable gpa=0x%lx hpa=0x%lx size=0x%lx\n",
+				 gpa, hpa, size);
 			return -EPERM;
+		}
 
 		if (pkvm_vm_hpa_hits_attached_boot_ptdev_bar(kvm, hpa, size)) {
+			pkvm_err("pkvm: vm_mmu_map: attached BAR gpa=0x%lx hpa=0x%lx size=0x%lx\n",
+				 gpa, hpa, size);
 			ret = pkvm_host_map_guest_mmio(vcpu, gpa, hpa, size);
 		} else if (pkvm_host_hpa_hits_boot_ptdev_bar(hpa, size)) {
 			pkvm_err("pkvm: vm_mmu_map: reject boot ptdev BAR HPA not attached to VM gpa=0x%lx hpa=0x%lx size=0x%lx\n",
@@ -1834,6 +1842,9 @@ static int pkvm_vm_mmu_map(unsigned long gpa, unsigned long hpa,
 			ret = -EPERM;
 		} else {
 			ret = pkvm_host_donate_guest(vcpu, gpa, hpa, size);
+			if (ret)
+				pkvm_err("pkvm: vm_mmu_map: donate failed ret=%d gpa=0x%lx hpa=0x%lx size=0x%lx\n",
+					 ret, gpa, hpa, size);
 		}
 	} else {
 		ret = pkvm_host_share_guest(vcpu, gpa, hpa, size, writable);

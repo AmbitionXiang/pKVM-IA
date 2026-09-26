@@ -1324,8 +1324,11 @@ static int pkvm_vcpu_pre_run(struct kvm_vcpu *vcpu)
 	if (unlikely(pkvm_is_protected_vcpu(vcpu) && !kvm_vcpu_has_run(vcpu) &&
 		     kvm_vcpu_is_reset_bsp(vcpu))) {
 		mutex_lock(&pkvm->finalized_lock);
-		if (!pkvm->finalized)
+		if (!pkvm->finalized) {
 			ret = pkvm_hypercall(vm_finalize, pkvm->handle);
+			pr_info("pkvm: vm_finalize handle=%d ret=%d finalized=%d\n",
+				pkvm->handle, ret, pkvm->finalized);
+		}
 		mutex_unlock(&pkvm->finalized_lock);
 		if (ret < 0)
 			return ret;
