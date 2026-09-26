@@ -368,12 +368,7 @@ out_put:
 
 static int pkvm_sync_ptdev_mmio_metadata(struct kvm *kvm)
 {
-	struct kvm_pkvm_vm *pkvm = &kvm->arch.pkvm;
-
-	if (!pkvm->handle)
-		return -ENODEV;
-
-	return pkvm_hypercall(sync_ptdev_mmio_metadata, pkvm->handle);
+	return pkvm_hypercall(sync_ptdev_mmio_metadata, kvm->arch.pkvm.handle);
 }
 
 static int pkvm_vm_ioctl_set_ptdev_mmio_metadata(
