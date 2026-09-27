@@ -215,17 +215,17 @@ static int check_host_mem_pgstate_mask(unsigned long phys, unsigned long size,
 	for_each_pkvm_page(page, phys, size) {
 		if (!((1 << page->host_state) & states)) {
 			kvm_err("pkvm: pgstate mismatch: phys=0x%lx host_state=%d expected_mask=0x%llx\n",
-				(unsigned long)page_to_phys(page), page->host_state, states);
+				(unsigned long)pkvm_page_to_phys(page), page->host_state, states);
 			return -EPERM;
 		}
 		if (page->owner != owner) {
 			kvm_err("pkvm: pgstate owner mismatch: phys=0x%lx owner=%d expected=%d\n",
-				(unsigned long)page_to_phys(page), page->owner, owner);
+				(unsigned long)pkvm_page_to_phys(page), page->owner, owner);
 			return -EPERM;
 		}
 		if (check_zero_refcnt && page->refcount) {
 			kvm_err("pkvm: pgstate refcount nonzero: phys=0x%lx refcount=%d\n",
-				(unsigned long)page_to_phys(page), page->refcount);
+				(unsigned long)pkvm_page_to_phys(page), page->refcount);
 			return -EPERM;
 		}
 	}
