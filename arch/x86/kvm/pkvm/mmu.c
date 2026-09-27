@@ -213,12 +213,21 @@ static int check_host_mem_pgstate_mask(unsigned long phys, unsigned long size,
 		return -EINVAL;
 
 	for_each_pkvm_page(page, phys, size) {
-		if (!((1 << page->host_state) & states))
+		if (!((1 << page->host_state) & states)) {
+			kvm_err("pkvm: pgstate mismatch: phys=0x%lx host_state=%d expected_mask=0x%llx\n",
+				(unsigned long)page_to_phys(page), page->host_state, states);
 			return -EPERM;
-		if (page->owner != owner)
+		}
+		if (page->owner != owner) {
+			kvm_err("pkvm: pgstate owner mismatch: phys=0x%lx owner=%d expected=%d\n",
+				(unsigned long)page_to_phys(page), page->owner, owner);
 			return -EPERM;
-		if (check_zero_refcnt && page->refcount)
+		}
+		if (check_zero_refcnt && page->refcount) {
+			kvm_err("pkvm: pgstate refcount nonzero: phys=0x%lx refcount=%d\n",
+				(unsigned long)page_to_phys(page), page->refcount);
 			return -EPERM;
+		}
 	}
 
 	return 0;
@@ -1470,12 +1479,18 @@ int pkvm_host_donate_guest(struct kvm_vcpu *vcpu, unsigned long gpa,
 	pkvm_guest_mmu_lock(pkvm_vm);
 
 	ret = check_host_mem_pgstate(hpa, size, PKVM_PAGE_OWNED, PKVM_ID_HOST, true);
-	if (ret)
+	if (ret) {
+		kvm_err("pkvm: donate: check_host_mem_pgstate failed ret=%d hpa=0x%lx size=0x%lx\n",
+			ret, hpa, size);
 		goto unlock;
+	}
 
 	ret = check_page_state(&pkvm_vm->mmu, gpa, size, PKVM_PAGE_NONE);
-	if (ret)
+	if (ret) {
+		kvm_err("pkvm: donate: check_page_state failed ret=%d gpa=0x%lx size=0x%lx\n",
+			ret, gpa, size);
 		goto unlock;
+	}
 
 	/* The vaddr == phys for the host MMU. */
 	ret = pkvm_pgtable_unmap(&host_mmu, hpa, hpa, size);
