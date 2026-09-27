@@ -384,9 +384,13 @@ static int pkvm_vm_finalize(int vm_handle)
 	gpa_t pvmfw_load_addr;
 	int ret = 0, i;
 
+	pkvm_err("pkvm: vm_finalize called vm_handle=%d\n", vm_handle);
+
 	pkvm_vm = pkvm_get_vm(vm_handle);
-	if (!pkvm_vm)
+	if (!pkvm_vm) {
+		pkvm_err("pkvm: vm_finalize: pkvm_get_vm failed vm_handle=%d\n", vm_handle);
 		return -EINVAL;
+	}
 
 	kvm = &pkvm_vm->kvm;
 	shared_kvm = pkvm_vm->shared_kvm;
@@ -431,10 +435,14 @@ static int pkvm_vm_finalize(int vm_handle)
 	/* Pairs with smp_load_acquire() in pkvm_host_donate_guest(). */
 	smp_store_release(&kvm->arch.pkvm.finalized, true);
 	shared_kvm->arch.pkvm.finalized = true;
+	pkvm_err("pkvm: vm_finalize success vm_handle=%d hyp_finalized=%d shared_finalized=%d\n",
+		 vm_handle, kvm->arch.pkvm.finalized, shared_kvm->arch.pkvm.finalized);
 unlock:
 	pkvm_spin_unlock(&pkvm_vm->lock);
 put_pkvm_vm:
 	pkvm_put_vm(pkvm_vm);
+	if (ret)
+		pkvm_err("pkvm: vm_finalize failed vm_handle=%d ret=%d\n", vm_handle, ret);
 	return ret;
 }
 

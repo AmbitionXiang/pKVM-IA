@@ -1321,13 +1321,20 @@ static int pkvm_vcpu_pre_run(struct kvm_vcpu *vcpu)
 	struct kvm_pkvm_vm *pkvm = &vcpu->kvm->arch.pkvm;
 	int ret = 0;
 
+	pr_err("pkvm: pre_run vcpu_id=%d protected=%d has_run=%d is_bsp=%d finalized=%d handle=%d\n",
+	       vcpu->vcpu_id, pkvm_is_protected_vcpu(vcpu),
+	       kvm_vcpu_has_run(vcpu), kvm_vcpu_is_reset_bsp(vcpu),
+	       pkvm->finalized, pkvm->handle);
+
 	if (unlikely(pkvm_is_protected_vcpu(vcpu) && !kvm_vcpu_has_run(vcpu) &&
 		     kvm_vcpu_is_reset_bsp(vcpu))) {
 		mutex_lock(&pkvm->finalized_lock);
 		if (!pkvm->finalized) {
 			ret = pkvm_hypercall(vm_finalize, pkvm->handle);
-			pr_info("pkvm: vm_finalize handle=%d ret=%d finalized=%d\n",
-				pkvm->handle, ret, pkvm->finalized);
+			pr_err("pkvm: vm_finalize handle=%d ret=%d finalized=%d\n",
+			       pkvm->handle, ret, pkvm->finalized);
+		} else {
+			pr_err("pkvm: vm_finalize skipped, already finalized\n");
 		}
 		mutex_unlock(&pkvm->finalized_lock);
 		if (ret < 0)

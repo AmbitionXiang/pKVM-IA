@@ -1460,8 +1460,11 @@ int pkvm_host_donate_guest(struct kvm_vcpu *vcpu, unsigned long gpa,
 		return -EPERM;
 
 	/* If the VM is not finalized yet, we don't know if we need to load pvmfw. */
-	if (!smp_load_acquire(&pkvm_vm->kvm.arch.pkvm.finalized))
+	if (!smp_load_acquire(&pkvm_vm->kvm.arch.pkvm.finalized)) {
+		kvm_err("pkvm: donate: !finalized gpa=0x%lx hpa=0x%lx size=0x%lx vm_handle=%d\n",
+			gpa, hpa, size, pkvm_vm->kvm.arch.pkvm.handle);
 		return -EPERM;
+	}
 
 	pkvm_host_mmu_lock();
 	pkvm_guest_mmu_lock(pkvm_vm);
