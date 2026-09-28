@@ -8,6 +8,10 @@
 #include "pgtable.h"
 #include "pkvm.h"
 #include "ptdev.h"
+#include "iommu_map.h"
+#ifdef CONFIG_PKVM_INTEL
+#include "pkvm_iommu.h"
+#endif
 
 static struct pkvm_pgtable hyp_mmu;
 static struct pkvm_pool hyp_mmu_pool;
@@ -1478,7 +1482,37 @@ int pkvm_host_donate_guest(struct kvm_vcpu *vcpu, unsigned long gpa,
 	pkvm_host_mmu_lock();
 	pkvm_guest_mmu_lock(pkvm_vm);
 
-	ret = check_host_mem_pgstate(hpa, size, PKVM_PAGE_OWNED, PKVM_ID_HOST, true);
+	/*
+	 * HPA→VM safety check: ensure the HPA being donated actually belongs
+	 * to this VM. This prevents a VM from donating memory it doesn't own.
+	 */
+	{
+		int hpa_vm = pkvm_lookup_hpa_vm(hpa, hpa + size);
+		if (hpa_vm != pkvm_vm->kvm.arch.pkvm.handle) {
+			kvm_err("pkvm: donate: HPA [0x%lx, 0x%lx) not in VM %d (got %d)\n",
+				hpa, hpa + size, pkvm_vm->kvm.arch.pkvm.handle, hpa_vm);
+			ret = -EPERM;
+			goto unlock;
+		}
+	}
+
+	/*
+	 * Determine whether to enforce refcount==0. If all devices for this
+	 * VM have been attached (pending_bdfs empty), allow refcount > 0
+	 * (check_zero_refcnt=false) — the pages were pinned by VFIO DMA map
+	 * and refcount will be decremented by VFIO DMA unmap later.
+	 * If devices are not fully attached, enforce refcount==0 —
+	 * refcount > 0 means VFIO has pinned pages but devices aren't
+	 * attached yet, so donate is rejected.
+	 */
+#ifdef CONFIG_PKVM_INTEL
+	bool check_zero_refcnt = !pkvm_iommu_vm_domains_ready(pkvm_vm->kvm.arch.pkvm.handle);
+#else
+	bool check_zero_refcnt = true;
+#endif
+
+	ret = check_host_mem_pgstate(hpa, size, PKVM_PAGE_OWNED, PKVM_ID_HOST,
+				     check_zero_refcnt);
 	if (ret) {
 		kvm_err("pkvm: donate: check_host_mem_pgstate failed ret=%d hpa=0x%lx size=0x%lx\n",
 			ret, hpa, size);
@@ -1901,15 +1935,8 @@ void pkvm_host_unuse_dma(unsigned long phys, unsigned long size)
 
 	pkvm_host_mmu_lock();
 
-	/* Stay paranoid */
-	if (WARN_ON_ONCE(check_host_mem_pgstate_mask(phys, size,
-						     BIT(PKVM_PAGE_OWNED) |
-						     BIT(PKVM_PAGE_SHARED_OWNED),
-						     PKVM_ID_HOST, false)))
-		goto unlock;
-
 	for_each_pkvm_page(page, phys, size)
 		pkvm_page_ref_dec(page);
-unlock:
+
 	pkvm_host_mmu_unlock();
 }

@@ -14147,6 +14147,62 @@ void kvm_arch_commit_memory_region(struct kvm *kvm,
 
 	kvm_mmu_slot_apply_flags(kvm, old, new, change);
 
+#ifndef __PKVM_HYP__
+	if (change == KVM_MR_CREATE && pkvm_is_protected_vm(kvm)) {
+		unsigned long hva = new->userspace_addr;
+		unsigned long nr_pages = new->npages;
+		int vm_handle = kvm->arch.pkvm.handle;
+		struct page **pages;
+		int ret;
+
+		pages = kvmalloc_array(nr_pages, sizeof(struct page *), GFP_KERNEL);
+		if (!pages) {
+			kvm_err("pkvm: register_hpa_vm: failed to alloc page array\n");
+			return;
+		}
+
+		ret = get_user_pages_fast(hva, nr_pages, 0, pages);
+		if (ret != nr_pages) {
+			kvm_err("pkvm: register_hpa_vm: get_user_pages_fast failed ret=%d expected=%lu\n",
+				ret, nr_pages);
+			kvfree(pages);
+			return;
+		}
+
+		{
+			unsigned long i;
+			unsigned long range_start = page_to_phys(pages[0]);
+			unsigned long range_end = range_start + PAGE_SIZE;
+
+			for (i = 1; i < nr_pages; i++) {
+				unsigned long hpa = page_to_phys(pages[i]);
+
+				if (hpa == range_end) {
+					range_end += PAGE_SIZE;
+				} else {
+					ret = pkvm_hypercall(register_hpa_vm,
+							     range_start, range_end,
+							     vm_handle);
+					if (ret)
+						kvm_err("pkvm: register_hpa_vm failed hpa=0x%lx end=0x%lx vm=%d ret=%d\n",
+							range_start, range_end, vm_handle, ret);
+					range_start = hpa;
+					range_end = hpa + PAGE_SIZE;
+				}
+			}
+			ret = pkvm_hypercall(register_hpa_vm,
+					     range_start, range_end, vm_handle);
+			if (ret)
+				kvm_err("pkvm: register_hpa_vm failed hpa=0x%lx end=0x%lx vm=%d ret=%d\n",
+					range_start, range_end, vm_handle, ret);
+		}
+
+		for (unsigned long i = 0; i < nr_pages; i++)
+			put_page(pages[i]);
+		kvfree(pages);
+	}
+#endif
+
 	/* Free the arrays associated with the old memslot. */
 	if (change == KVM_MR_MOVE)
 		kvm_arch_free_memslot(kvm, old);

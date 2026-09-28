@@ -762,6 +762,13 @@ struct dmar_domain {
 	struct qi_batch _qi_batch;		/* domain->qi_batch = &domain->_qi_batch */
 
 	struct hlist_node hnode;
+
+	/* PKVM: VM handle that this domain is associated with (0 = unassigned) */
+	int vm_handle;
+	/* PKVM: BDFs of devices that have pasid_setup_sl but not yet attach_ptdev */
+#define MAX_PENDING_BDFS	8
+	u16 pending_bdfs[MAX_PENDING_BDFS];
+	u8 pending_count;
 #endif /* !__PKVM_HYP__ */
 };
 

@@ -380,10 +380,26 @@ static int iommu_pasid_setup_sl(struct pasid_setup_sl_data *data)
 
 	ret = intel_pasid_setup_second_level(iommu, domain, &dev,
 					     data->did, data->pasid);
-	if (ret)
+	if (ret) {
 		pkvm_put_iommu_domain(domain);
+		return ret;
+	}
 
-	return ret;
+	pkvm_spin_lock(&domain->lock);
+	if (domain->pending_count < MAX_PENDING_BDFS) {
+		u16 bdf = PCI_DEVID(data->bus, data->devfn);
+		int i;
+		for (i = 0; i < domain->pending_count; i++) {
+			if (domain->pending_bdfs[i] == bdf)
+				break;
+		}
+		if (i == domain->pending_count)
+			domain->pending_bdfs[domain->pending_count++] = bdf;
+	}
+	pkvm_spin_unlock(&domain->lock);
+
+	pkvm_put_iommu_domain(domain);
+	return 0;
 }
 
 int pkvm_iommu_pasid_setup_sl(struct pasid_setup_sl_data *in, struct pasid_setup_sl_data *out)

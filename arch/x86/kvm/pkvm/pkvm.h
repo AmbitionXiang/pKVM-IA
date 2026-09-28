@@ -70,6 +70,8 @@ struct pkvm_vm {
 #ifdef CONFIG_PKVM_INTEL
 	/* Linked list of passthrough devices assigned to this VM */
 	struct list_head ptdev_head;
+	/* HPA ranges registered for this VM (for IOMMU domain→VM association) */
+	struct list_head hpa_range_head;
 	/* MMIO allowlist for guest */
 	u16 mmio_allow_nr_ranges;
 	u16 mmio_allow_generation;

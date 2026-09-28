@@ -13,6 +13,7 @@
 #include "pkvm.h"
 #include "trace.h"
 #include "ptdev.h"
+#include "iommu_map.h"
 #include "../x86.h"
 #include "../lapic.h"
 #include "pkvm_iommu.h"
@@ -174,6 +175,7 @@ static int pkvm_vm_init(phys_addr_t host_kvm_pa, phys_addr_t pkvm_vm_pa,
 
 	pkvm_spin_lock_init(&pkvm_vm->lock);
 	INIT_LIST_HEAD(&pkvm_vm->ptdev_head);
+	INIT_LIST_HEAD(&pkvm_vm->hpa_range_head);
 
 	ret = pkvm_guest_mmu_init(pkvm_vm, pgd_pa);
 	if (ret)
@@ -240,6 +242,7 @@ static int pkvm_vm_destroy(int vm_handle, struct pkvm_memcache *mc)
 
 #ifdef CONFIG_PKVM_INTEL
 	pkvm_vm_destroy_ptdevs(pkvm_vm);
+	pkvm_destroy_hpa_ranges(pkvm_vm);
 #endif
 
 	kvm_x86_call(vm_destroy)(&pkvm_vm->kvm);
@@ -2136,6 +2139,11 @@ static int pkvm_hc_remove_ptdev(int vm_handle, u16 bdf)
 	return ret;
 }
 
+static int pkvm_hc_register_hpa_vm(u64 hpa_start, u64 hpa_end, int vm_handle)
+{
+	return pkvm_register_hpa_vm(hpa_start, hpa_end, vm_handle);
+}
+
 static int pkvm_hc_sync_ptdev_mmio_metadata(int vm_handle)
 {
 	struct pkvm_vm *pkvm_vm;
@@ -2319,6 +2327,11 @@ void pkvm_handle_host_hypercall(struct kvm_vcpu *vcpu)
 		break;
 	case __pkvm__sync_ptdev_mmio_metadata:
 		ret = pkvm_hc_sync_ptdev_mmio_metadata(pkvm_hc_input1(vcpu));
+		break;
+	case __pkvm__register_hpa_vm:
+		ret = pkvm_hc_register_hpa_vm(pkvm_hc_input1(vcpu),
+					      pkvm_hc_input2(vcpu),
+					      (int)pkvm_hc_input3(vcpu));
 		break;
 #endif
 	default:

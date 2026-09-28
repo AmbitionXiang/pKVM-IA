@@ -213,6 +213,9 @@ int pkvm_iommu_domain_map(struct domain_map_data *in, struct domain_map_data *ou
 int pkvm_iommu_domain_unmap(u64 pgd_gpa, u64 start_pfn, u64 last_pfn);
 int pkvm_iommu_modify_irte(struct modify_irte_data *data);
 
+int pkvm_iommu_attach_ptdev(u16 bdf, int vm_handle);
+bool pkvm_iommu_vm_domains_ready(int vm_handle);
+
 /*
  * Return value from a pKVM MMIO register validator meaning "this offset is not
  * one of my registers" -- the dispatcher should try the next handler or fall to

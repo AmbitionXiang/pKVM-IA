@@ -603,6 +603,14 @@ int pkvm_attach_ptdev(u16 bdf, struct pkvm_vm *vm)
 
 	pkvm_spin_unlock(&ptdev->lock);
 
+	ret = pkvm_iommu_attach_ptdev(bdf, vm_handle);
+	if (ret) {
+		pkvm_err("%s: pkvm_iommu_attach_ptdev failed bdf=0x%x ret=%d\n",
+			 __func__, bdf, ret);
+		pkvm_detach_ptdev(ptdev, vm);
+		return ret;
+	}
+
 	pkvm_vm_link_ptdev(vm, &ptdev->vm_node);
 
 	pkvm_spin_lock(&ptdev->lock);

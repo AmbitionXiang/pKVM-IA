@@ -8,6 +8,7 @@
 #include "pkvm/debug.h"
 #include "pkvm/memory.h"
 #include "pkvm/vmx/ept.h"
+#include "pkvm/iommu_map.h"
 #include "../iommu.h"
 
 /*
@@ -308,6 +309,24 @@ static int iommu_domain_map(struct domain_map_data *data)
 		return -EINVAL;
 	}
 
+	{
+		int hpa_vm = pkvm_lookup_hpa_vm(phys, phys + size);
+		if (hpa_vm < 0) {
+			pkvm_err("%s: HPA [0x%llx, 0x%llx) not in any VM mapping\n",
+				 __func__, phys, phys + size);
+			pkvm_put_iommu_domain(domain);
+			return -EPERM;
+		}
+		if (domain->vm_handle == 0) {
+			domain->vm_handle = hpa_vm;
+		} else if (domain->vm_handle != hpa_vm) {
+			pkvm_err("%s: cross-VM mapping! domain->vm_handle=%d hpa_vm=%d\n",
+				 __func__, domain->vm_handle, hpa_vm);
+			pkvm_put_iommu_domain(domain);
+			return -EPERM;
+		}
+	}
+
 	pkvm_spin_lock(&domain->lock);
 	if (data->mc.count) {
 		ret = refill_domain_memcache(domain, &data->mc);
@@ -358,4 +377,57 @@ int pkvm_iommu_domain_unmap(u64 pgd_gpa, u64 start_pfn, u64 last_pfn)
 	pkvm_put_iommu_domain(domain);
 
 	return 0;
+}
+
+int pkvm_iommu_attach_ptdev(u16 bdf, int vm_handle)
+{
+	struct dmar_domain *domain;
+	int i, j;
+	int ret = -ENODEV;
+
+	pkvm_spin_lock(&iommu_domain_lock);
+	for (i = 0; i < MAX_IOMMU_DOMAIN_NUM; i++) {
+		if (!test_bit(i, iommu_domains_bitmap))
+			continue;
+		domain = &iommu_domains[i];
+		for (j = 0; j < domain->pending_count; j++) {
+			if (domain->pending_bdfs[j] == bdf) {
+				domain->pending_bdfs[j] =
+					domain->pending_bdfs[--domain->pending_count];
+				if (domain->vm_handle == 0) {
+					domain->vm_handle = vm_handle;
+				} else if (domain->vm_handle != vm_handle) {
+					pkvm_err("%s: cross-VM attach! domain->vm_handle=%d vm_handle=%d\n",
+						 __func__, domain->vm_handle, vm_handle);
+					ret = -EPERM;
+					goto out;
+				}
+				ret = 0;
+				goto out;
+			}
+		}
+	}
+out:
+	pkvm_spin_unlock(&iommu_domain_lock);
+	return ret;
+}
+
+bool pkvm_iommu_vm_domains_ready(int vm_handle)
+{
+	struct dmar_domain *domain;
+	int i;
+	bool ready = true;
+
+	pkvm_spin_lock(&iommu_domain_lock);
+	for (i = 0; i < MAX_IOMMU_DOMAIN_NUM; i++) {
+		if (!test_bit(i, iommu_domains_bitmap))
+			continue;
+		domain = &iommu_domains[i];
+		if (domain->vm_handle == vm_handle && domain->pending_count > 0) {
+			ready = false;
+			break;
+		}
+	}
+	pkvm_spin_unlock(&iommu_domain_lock);
+	return ready;
 }

@@ -112,6 +112,7 @@ PKVM_HC_IN(iommu_modify_irte)
 PKVM_HC(add_ptdev)
 PKVM_HC(remove_ptdev)
 PKVM_HC(sync_ptdev_mmio_metadata)
+PKVM_HC(register_hpa_vm)
 #endif
 
 #undef PKVM_HC
