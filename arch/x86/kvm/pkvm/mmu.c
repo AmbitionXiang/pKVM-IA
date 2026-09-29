@@ -1867,10 +1867,54 @@ int pkvm_host_use_dma(unsigned long phys, unsigned long size)
 	pkvm_host_mmu_lock();
 
 	if (is_memory_range(phys, size)) {
-		ret = check_host_mem_pgstate_mask(phys, size,
-						  BIT(PKVM_PAGE_OWNED) |
-						  BIT(PKVM_PAGE_SHARED_OWNED),
-						  PKVM_ID_HOST, false);
+		/*
+		 * Distinguish host DMA from pVM DMA via the HPA→VM mapping.
+		 *
+		 * NoIommu: map after HPA register, before donate
+		 *   → vm_handle >= 0, pages OWNED, owner=HOST.
+		 * viommu:  map after HPA register, after donate
+		 *   → vm_handle >= 0, pages NONE, owner=GUEST.
+		 * host DMA (non-pVM): vm_handle < 0, pages OWNED, owner=HOST.
+		 */
+		int vm_handle = pkvm_lookup_hpa_vm(phys, phys + size);
+
+		if (vm_handle < 0) {
+			/* HPA not in any VM: host DMA, original logic. */
+			ret = check_host_mem_pgstate_mask(phys, size,
+							  BIT(PKVM_PAGE_OWNED) |
+							  BIT(PKVM_PAGE_SHARED_OWNED),
+							  PKVM_ID_HOST, false);
+		} else {
+			/* HPA belongs to a VM.  Try HOST-owned first
+			 * (NoIommu, before donate). */
+			ret = check_host_mem_pgstate_mask(phys, size,
+							  BIT(PKVM_PAGE_OWNED) |
+							  BIT(PKVM_PAGE_SHARED_OWNED),
+							  PKVM_ID_HOST, false);
+			if (ret) {
+				/* Not HOST-owned; require GUEST-owned NONE
+				 * (viommu, after donate). */
+				ret = check_host_mem_pgstate_mask(phys, size,
+								  BIT(PKVM_PAGE_NONE),
+								  PKVM_ID_GUEST, false);
+				if (ret == 0) {
+					/*
+					 * viommu final security check:
+					 * ensure all devices for this VM are
+					 * attached (pending_bdfs empty).
+					 */
+#ifdef CONFIG_PKVM_INTEL
+					if (!pkvm_iommu_vm_domains_ready(vm_handle)) {
+						kvm_err("pkvm: use_dma: devices not attached for VM %d\n",
+							vm_handle);
+						ret = -EPERM;
+					}
+#else
+					ret = -EPERM;
+#endif
+				}
+			}
+		}
 		if (ret)
 			goto unlock;
 
