@@ -10,7 +10,7 @@ struct pkvm_vm;
 
 #ifdef CONFIG_PKVM_INTEL
 
-#define MAX_HPA_RANGES	256
+#define MAX_HPA_RANGES	4096
 
 struct pkvm_hpa_range {
 	u64 hpa_start;

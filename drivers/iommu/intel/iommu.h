@@ -656,6 +656,10 @@ struct qi_batch {
 	unsigned int index;
 };
 
+#define PKVM_DOMAIN_UNBOUND (-1)
+#define PKVM_DOMAIN_HOST (-2)
+/* domain.vm_handle >= 0 indicates this domain is bound to a pVM */
+
 struct dmar_domain {
 #ifndef __PKVM_HYP__
 	int	nid;			/* node id */
@@ -763,7 +767,7 @@ struct dmar_domain {
 
 	struct hlist_node hnode;
 
-	/* PKVM: VM handle that this domain is associated with (0 = unassigned) */
+	/* PKVM: VM handle that this domain is associated with (vm_handle < 0 indicates unassigned to any VM) */
 	int vm_handle;
 	/* PKVM: BDFs of devices that have pasid_setup_sl but not yet attach_ptdev */
 #define MAX_PENDING_BDFS	8

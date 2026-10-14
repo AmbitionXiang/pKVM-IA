@@ -53,8 +53,26 @@ int pkvm_iommu_clear_ce(struct clear_ce_data *data)
 	pkvm_dbg("%s: dev[%x:%x], ats_qdep: %d\n",
 		 __func__, data->bus, data->devfn, data->ats_qdep);
 	domain_context_clear_one(&info, data->bus, data->devfn, &domain);
-	if (domain)
+	if (domain) {
+		if (domain != &pt_domain) {
+			u16 bdf = PCI_DEVID(data->bus, data->devfn);
+			int i;
+
+			pkvm_spin_lock(&domain->lock);
+			/* The cleared context no longer binds this BDF to the domain. */
+			for (i = 0; i < domain->pending_count; i++) {
+				if (domain->pending_bdfs[i] != bdf)
+					continue;
+				domain->pending_count--;
+				domain->pending_bdfs[i] =
+					domain->pending_bdfs[domain->pending_count];
+				domain->pending_bdfs[domain->pending_count] = 0;
+				break;
+			}
+			pkvm_spin_unlock(&domain->lock);
+		}
 		pkvm_put_iommu_domain(domain);
+	}
 
 	return 0;
 }
@@ -136,6 +154,25 @@ static int iommu_set_lm_ce(struct set_lm_ce_data *data)
 
 	ret = domain_context_mapping_one(domain, iommu, &info, data->did,
 					 data->bus, data->devfn);
+
+	if (!ret && domain != &pt_domain) {
+		int i;
+
+		pkvm_spin_lock(&domain->lock);
+		for (i = 0; i < domain->pending_count; i++) {
+			if (domain->pending_bdfs[i] == bdf)
+				break;
+		}
+		if (i == domain->pending_count) {
+			if (domain->pending_count < MAX_PENDING_BDFS)
+				domain->pending_bdfs[domain->pending_count++] = bdf;
+			else
+				pkvm_err("%s: pending BDFs full, bdf=0x%x\n",
+						__func__, bdf);
+		}
+		pkvm_spin_unlock(&domain->lock);
+	}
+
 	if (ret) {
 		pkvm_put_iommu_domain(domain);
 		/*
