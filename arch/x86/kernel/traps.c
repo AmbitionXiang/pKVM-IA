@@ -67,6 +67,8 @@
 #include <asm/insn-eval.h>
 #include <asm/vdso.h>
 #include <asm/tdx.h>
+#include <asm/coco.h>
+#include <asm/pkvm_guest.h>
 #include <asm/cfi.h>
 #include <asm/msr.h>
 
@@ -1457,7 +1459,7 @@ DEFINE_IDTENTRY(exc_device_not_available)
 	}
 }
 
-#ifdef CONFIG_INTEL_TDX_GUEST
+#if defined(CONFIG_INTEL_TDX_GUEST) || defined(CONFIG_PKVM_X86_GUEST)
 
 #define VE_FAULT_STR "VE fault"
 
@@ -1519,28 +1521,51 @@ static void ve_raise_fault(struct pt_regs *regs, long error_code,
  * Changes in the entry code have to be audited for correctness vs. this
  * aspect. Similarly to #PF, #VE in these places will expose kernel to
  * privilege escalation or may lead to random crashes.
+ *
+ * For pVM guests, #VE is injected in software by the hypervisor when an
+ * EPT violation occurs on an MMIO address that bypasses pv_mmio. The
+ * guest #VE handler decodes the faulting instruction and completes the
+ * MMIO access via hypercall.
  */
 DEFINE_IDTENTRY(exc_virtualization_exception)
 {
-	struct ve_info ve;
+	if (cc_vendor == CC_VENDOR_INTEL) {
+#ifdef CONFIG_INTEL_TDX_GUEST
+		struct ve_info ve;
 
-	/*
-	 * NMIs/Machine-checks/Interrupts will be in a disabled state
-	 * till TDGETVEINFO TDCALL is executed. This ensures that VE
-	 * info cannot be overwritten by a nested #VE.
-	 */
-	tdx_get_ve_info(&ve);
+		/*
+		 * NMIs/Machine-checks/Interrupts will be in a disabled state
+		 * till TDGETVEINFO TDCALL is executed. This ensures that VE
+		 * info cannot be overwritten by a nested #VE.
+		 */
+		tdx_get_ve_info(&ve);
 
-	cond_local_irq_enable(regs);
+		cond_local_irq_enable(regs);
 
-	/*
-	 * If tdx_handle_virt_exception() could not process
-	 * it successfully, treat it as #GP(0) and handle it.
-	 */
-	if (!tdx_handle_virt_exception(regs, &ve))
-		ve_raise_fault(regs, 0, ve.gla);
+		/*
+		 * If tdx_handle_virt_exception() could not process
+		 * it successfully, treat it as #GP(0) and handle it.
+		 */
+		if (!tdx_handle_virt_exception(regs, &ve))
+			ve_raise_fault(regs, 0, ve.gla);
 
-	cond_local_irq_disable(regs);
+		cond_local_irq_disable(regs);
+#endif
+	} else if (cc_vendor == CC_VENDOR_PKVM) {
+#ifdef CONFIG_PKVM_X86_GUEST
+		int insn_len;
+
+		cond_local_irq_enable(regs);
+
+		insn_len = pkvm_handle_ve(regs);
+		if (insn_len < 0)
+			ve_raise_fault(regs, 0, 0);
+		else
+			regs->ip += insn_len;
+
+		cond_local_irq_disable(regs);
+#endif
+	}
 }
 
 #endif

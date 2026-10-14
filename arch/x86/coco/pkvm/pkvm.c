@@ -2,10 +2,14 @@
 
 #include <linux/kvm_para.h>
 #include <linux/io.h>
+#include <linux/uaccess.h>
 #include <asm/coco.h>
 #include <asm/pkvm_guest.h>
 #include <asm/pgtable.h>
 #include <asm/apic.h>
+#include <asm/insn.h>
+#include <asm/insn-eval.h>
+#include <asm/traps.h>
 
 DEFINE_STATIC_KEY_FALSE(pkvm_guest_detected);
 EXPORT_SYMBOL(pkvm_guest_detected);
@@ -282,4 +286,106 @@ __init void pkvm_guest_init_coco(void)
 	static_branch_enable(&pv_mmio);
 
 	apic_update_callback(wakeup_secondary_cpu, pkvm_wakeup_secondary_cpu);
+}
+
+static bool pkvm_mmio_read(int size, unsigned long gpa, unsigned long *val)
+{
+	*val = kvm_hypercall2(PKVM_GHC_IOREAD, gpa, size);
+	return true;
+}
+
+static bool pkvm_mmio_write(int size, unsigned long gpa, unsigned long val)
+{
+	kvm_hypercall3(PKVM_GHC_IOWRITE, gpa, size, val);
+	return true;
+}
+
+int pkvm_handle_ve(struct pt_regs *regs)
+{
+	unsigned long *reg, val, vaddr, gpa;
+	char buffer[MAX_INSN_SIZE];
+	enum insn_mmio_type mmio;
+	struct insn insn = {};
+	int size, extend_size;
+	u8 extend_val = 0;
+
+	if (WARN_ON_ONCE(user_mode(regs)))
+		return -EFAULT;
+
+	gpa = kvm_hypercall1(PKVM_GHC_GET_VE_GPA, 0);
+
+	if (copy_from_kernel_nofault(buffer, (void *)regs->ip, MAX_INSN_SIZE))
+		return -EFAULT;
+
+	if (insn_decode(&insn, buffer, MAX_INSN_SIZE, INSN_MODE_64))
+		return -EINVAL;
+
+	mmio = insn_decode_mmio(&insn, &size);
+	if (WARN_ON_ONCE(mmio == INSN_MMIO_DECODE_FAILED))
+		return -EINVAL;
+
+	if (mmio != INSN_MMIO_WRITE_IMM && mmio != INSN_MMIO_MOVS) {
+		reg = insn_get_modrm_reg_ptr(&insn, regs);
+		if (!reg)
+			return -EINVAL;
+	}
+
+	vaddr = (unsigned long)insn_get_addr_ref(&insn, regs);
+	if (!fault_in_kernel_space(vaddr)) {
+		WARN_ONCE(1, "Access to userspace address is not supported");
+		return -EINVAL;
+	}
+
+	if (vaddr / PAGE_SIZE != (vaddr + size - 1) / PAGE_SIZE)
+		return -EFAULT;
+
+	switch (mmio) {
+	case INSN_MMIO_WRITE:
+		memcpy(&val, reg, size);
+		if (!pkvm_mmio_write(size, gpa, val))
+			return -EIO;
+		return insn.length;
+	case INSN_MMIO_WRITE_IMM:
+		val = insn.immediate.value;
+		if (!pkvm_mmio_write(size, gpa, val))
+			return -EIO;
+		return insn.length;
+	case INSN_MMIO_READ:
+	case INSN_MMIO_READ_ZERO_EXTEND:
+	case INSN_MMIO_READ_SIGN_EXTEND:
+		break;
+	case INSN_MMIO_MOVS:
+	case INSN_MMIO_DECODE_FAILED:
+		return -EINVAL;
+	default:
+		WARN_ONCE(1, "Unknown insn_decode_mmio() decode value?");
+		return -EINVAL;
+	}
+
+	if (!pkvm_mmio_read(size, gpa, &val))
+		return -EIO;
+
+	switch (mmio) {
+	case INSN_MMIO_READ:
+		extend_size = size == 4 ? sizeof(*reg) : 0;
+		break;
+	case INSN_MMIO_READ_ZERO_EXTEND:
+		extend_size = insn.opnd_bytes;
+		break;
+	case INSN_MMIO_READ_SIGN_EXTEND:
+		extend_size = insn.opnd_bytes;
+		if (size == 1 && val & BIT(7))
+			extend_val = 0xFF;
+		else if (size > 1 && val & BIT(15))
+			extend_val = 0xFF;
+		break;
+	default:
+		WARN_ON_ONCE(1);
+		return -EINVAL;
+	}
+
+	if (extend_size)
+		memset(reg, extend_val, extend_size);
+	memcpy(reg, &val, size);
+	return insn.length;
 }

@@ -5031,9 +5031,19 @@ static int pkvm_page_fault(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault)
 
 	r = kvm_mmu_faultin_pfn(vcpu, fault, ACC_ALL);
 	if (r != RET_PF_CONTINUE) {
-		/* MMIO emulation works for non-protected VMs only. */
-		if (unlikely(pkvm_is_protected_vcpu(vcpu) && r == RET_PF_EMULATE))
-			return -EFAULT;
+		/*
+		 * MMIO emulation works for non-protected VMs only.
+		 * For pVM, a RET_PF_EMULATE here typically means the guest
+		 * accessed an MMIO GPA that has no memslot (e.g. a GPU
+		 * driver bypassing pv_mmio with a raw mov instruction).
+		 * Set ve_pending so the hypervisor injects #VE directly on
+		 * the next VM entry. The hypervisor controls the injection
+		 * so the host cannot inject arbitrary exceptions.
+		 */
+		if (unlikely(pkvm_is_protected_vcpu(vcpu) && r == RET_PF_EMULATE)) {
+			vcpu->arch.pkvm.ve_pending = true;
+			return RET_PF_RETRY;
+		}
 
 		if (unlikely(r != RET_PF_EMULATE && r != RET_PF_RETRY &&
 			     r != -EINTR && r != -EAGAIN && r != -EFAULT)) {
@@ -5082,8 +5092,19 @@ static int pkvm_page_fault(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault)
 	r = pkvm_hypercall(vm_mmu_map,
 			   base_gfn << PAGE_SHIFT, fault->pfn << PAGE_SHIFT,
 			   nr_pages << PAGE_SHIFT, fault->map_writable);
-	if (r)
+	if (r) {
+		/*
+		 * For pVM MMIO accesses (refcounted_page == NULL) that bypass
+		 * pv_mmio, the hypervisor rejects the EPT mapping because the
+		 * HPA is not RAM and not in the allow list. Set ve_pending so
+		 * the hypervisor injects #VE directly on the next VM entry.
+		 */
+		if (pkvm_is_protected_vcpu(vcpu) && !fault->refcounted_page) {
+			vcpu->arch.pkvm.ve_pending = true;
+			r = RET_PF_RETRY;
+		}
 		goto out_unlock;
+	}
 
 	r = RET_PF_FIXED;
 
@@ -5091,12 +5112,7 @@ static int pkvm_page_fault(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault)
 	mapping->pfn = fault->pfn;
 	mapping->nr_pages = nr_pages;
 
-	if (pkvm_is_protected_vcpu(vcpu)) {
-		if (WARN_ON_ONCE(!fault->refcounted_page)) {
-			r = -EFAULT;
-			goto out_unlock;
-		}
-
+	if (pkvm_is_protected_vcpu(vcpu) && fault->refcounted_page) {
 		/*
 		 * Pin pVM's page to prevent kernel from trying to swap or
 		 * migrate it.
@@ -5104,6 +5120,9 @@ static int pkvm_page_fault(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault)
 		 * FIXME: this still doesn't fully prevent kernel from trying
 		 * to access this page in all cases. We should eventually
 		 * switch to guest_memfd instead.
+		 *
+		 * MMIO regions (VM_IO/VM_PFNMAP) have no struct page,
+		 * so refcounted_page is NULL and pinning is skipped.
 		 */
 		get_page(fault->refcounted_page);
 		mapping->pinned_page = fault->refcounted_page;

@@ -14971,6 +14971,8 @@ static void __exit kvm_x86_exit(void)
 }
 module_exit(kvm_x86_exit);
 #else /* !__PKVM_HYP__ */
+void vmx_inject_exception(struct kvm_vcpu *vcpu);
+
 static void kvm_restore_user_return_msr(void)
 {
 	struct kvm_user_return_msrs *msrs = this_cpu_ptr(user_return_msrs);
@@ -14992,6 +14994,24 @@ static int __pkvm_vcpu_enter_guest(struct kvm_vcpu *vcpu, bool force_immediate_e
 	fastpath_t exit_fastpath;
 	u64 run_flags;
 	int ret;
+
+	/*
+	 * Inject #VE for MMIO accesses that bypass pv_mmio. The host sets
+	 * ve_pending in pkvm_page_fault when the guest accesses an MMIO GPA
+	 * with no memslot. The faulting GPA is saved by the hypervisor
+	 * directly from VMCS GUEST_PHYSICAL_ADDRESS in share_protected_vcpu_state,
+	 * so the host cannot tamper with it. Queue #VE and let the normal
+	 * KVM_REQ_EVENT -> kvm_check_and_inject_events path handle injection.
+	 * #VE (vector 20) does not have an error code, so use
+	 * kvm_queue_exception (not kvm_queue_exception_e). The guest retrieves
+	 * the faulting GPA via the PKVM_GHC_GET_VE_GPA hypercall.
+	 */
+	if (unlikely(to_pkvm_vcpu(vcpu)->shared_vcpu->arch.pkvm.ve_pending)) {
+		to_pkvm_vcpu(vcpu)->shared_vcpu->arch.pkvm.ve_pending = false;
+		pr_err("pkvm: queuing #VE for MMIO, ve_gpa=0x%llx\n",
+		       vcpu->arch.pkvm.ve_gpa);
+		kvm_queue_exception(vcpu, X86_TRAP_VE);
+	}
 
 	if (kvm_request_pending(vcpu)) {
 		if (kvm_check_request(KVM_REQ_TLB_FLUSH, vcpu))
@@ -15205,6 +15225,9 @@ int pkvm_emulate_hypercall(struct kvm_vcpu *vcpu)
 		ret = pkvm_handle_ptdev_mmio_read(vcpu, a0, a1, a2);
 		break;
 #endif
+	case PKVM_GHC_GET_VE_GPA:
+		kvm_rax_write(vcpu, vcpu->arch.pkvm.ve_gpa);
+		return kvm_skip_emulated_instruction(vcpu);
 	default:
 		/* Other hypercalls are not supported */
 		break;

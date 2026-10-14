@@ -8,6 +8,7 @@
 
 void pkvm_guest_init_coco(void);
 int pkvm_set_mem_host_visibility(unsigned long addr, int numpages, bool enc);
+int pkvm_handle_ve(struct pt_regs *regs);
 
 DECLARE_STATIC_KEY_FALSE(pkvm_guest_detected);
 
@@ -24,6 +25,7 @@ static inline int pkvm_set_mem_host_visibility(unsigned long addr,
 {
 	return 0;
 }
+static inline int pkvm_handle_ve(struct pt_regs *regs) { return -EINVAL; }
 
 static inline bool pkvm_is_protected_guest(void) { return false; }
 

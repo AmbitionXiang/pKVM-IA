@@ -8127,6 +8127,12 @@ static noinstr void vmx_vcpu_enter_exit(struct kvm_vcpu *vcpu,
 #ifndef __PKVM_HYP__
 		goto out;
 #else
+		{
+			u32 vm_err = vmcs_read32(VM_INSTRUCTION_ERROR);
+			pr_err("pkvm: VMLAUNCH failed, VM_INSTRUCTION_ERROR=0x%x\n",
+			       vm_err);
+			to_vmx(to_pkvm_vcpu(vcpu)->shared_vcpu)->error_code = vm_err;
+		}
 		return;
 #endif
 	}
@@ -9978,9 +9984,16 @@ static void share_protected_vcpu_state(struct kvm_vcpu *vcpu,
 	case EXIT_REASON_MSR_READ:
 		shared_vcpu->arch.regs[VCPU_REGS_RCX] = (u32)kvm_rcx_read(vcpu);
 		break;
-	case EXIT_REASON_EPT_VIOLATION:
-		to_vmx(shared_vcpu)->exit_gpa = vmcs_read64(GUEST_PHYSICAL_ADDRESS);
+	case EXIT_REASON_EPT_VIOLATION: {
+		gpa_t gpa = vmcs_read64(GUEST_PHYSICAL_ADDRESS);
+		to_vmx(shared_vcpu)->exit_gpa = gpa;
+		/*
+		 * Save the faulting GPA for software #VE injection. Read
+		 * directly from VMCS so the host cannot tamper with it.
+		 */
+		vcpu->arch.pkvm.ve_gpa = gpa;
 		break;
+	}
 	case EXIT_REASON_MSR_WRITE_IMM:
 		reg = vmx_get_msr_imm_reg(vcpu);
 		shared_vcpu->arch.regs[reg] = kvm_register_read(vcpu, reg);

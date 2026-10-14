@@ -827,6 +827,10 @@ struct kvm_pkvm_vcpu {
 
 	/* Used for passing additional parameters in requests from pKVM to host */
 	u64 req_param;
+
+	/* GPA and pending flag for software #VE injection (bypass pv_mmio MMIO access) */
+	gpa_t ve_gpa;
+	bool ve_pending;
 };
 #endif /* CONFIG_PKVM_X86 */
 
