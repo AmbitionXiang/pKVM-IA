@@ -169,9 +169,11 @@ static int pkvm_virt_mmio(int size, bool write, unsigned long vaddr, unsigned lo
 
 	paddr = (pte_pfn(*pte) << PAGE_SHIFT) | (vaddr & ~page_level_mask(level));
 
-	if (pkvm_mmio_allow_hit(paddr, size))
-		return write ? pkvm_direct_mmio_write(size, vaddr, *val) :
+	if (pkvm_mmio_allow_hit(paddr, size)) {
+		bool ret = write ? pkvm_direct_mmio_write(size, vaddr, *val) :
 			       pkvm_direct_mmio_read(size, vaddr, val);
+		return ret ? 0 : -EIO;
+	}
 
 	if (write)
 		kvm_hypercall3(PKVM_GHC_IOWRITE, paddr, size, *val);
