@@ -48,6 +48,7 @@ static struct pkvm_ptdev *__pkvm_alloc_ptdev_locked(u16 bdf)
 		ptdev->touched_bar_mask = 0;
 		ptdev->touched_mmio_range_count = 0;
 		ptdev->mmio_metadata_valid = false;
+		ptdev->vm_handle = PKVM_PTDEV_VM_UNBOUND;
 		memset(ptdev->bars, 0, sizeof(ptdev->bars));
 		memset(ptdev->touched_mmio_ranges, 0,
 		       sizeof(ptdev->touched_mmio_ranges));
@@ -425,7 +426,7 @@ void pkvm_detach_ptdev(struct pkvm_ptdev *ptdev, struct pkvm_vm *vm)
 		return;
 	}
 
-	ptdev->vm_handle = 0;
+	ptdev->vm_handle = PKVM_PTDEV_VM_UNBOUND;
 	ptdev->mmio_metadata_valid = false;
 	ptdev->guest_contract_published = false;
 	memset(&ptdev->mmio_metadata, 0, sizeof(ptdev->mmio_metadata));
@@ -591,7 +592,7 @@ int pkvm_attach_ptdev(u16 bdf, struct pkvm_vm *vm)
 	pkvm_spin_lock(&ptdev->lock);
 
 	vm_handle = vm->kvm.arch.pkvm.handle;
-	if (cmpxchg(&ptdev->vm_handle, 0, vm_handle) != 0) {
+	if (cmpxchg(&ptdev->vm_handle, PKVM_PTDEV_VM_UNBOUND, vm_handle) != PKVM_PTDEV_VM_UNBOUND) {
 		pkvm_err("%s: ptdev with bdf 0x%x is already attached\n",
 			 __func__, bdf);
 		pkvm_spin_unlock(&ptdev->lock);

@@ -11,6 +11,8 @@
 
 struct kvm;
 
+#define PKVM_PTDEV_VM_UNBOUND (-1)
+
 enum pkvm_ptdev_owner {
 	PKVM_PTDEV_OWNER_HOST,
 	PKVM_PTDEV_OWNER_HYP,
@@ -99,7 +101,6 @@ static inline bool match_ptdev(struct pkvm_ptdev *ptdev, u16 bdf)
 
 static inline bool ptdev_attached_to_vm(struct pkvm_ptdev *ptdev)
 {
-	/* Attached ptdev has non-zero vm_handle */
-	return cmpxchg(&ptdev->vm_handle, 0, 0) != 0;
+	return READ_ONCE(ptdev->vm_handle) >= 0;
 }
 #endif

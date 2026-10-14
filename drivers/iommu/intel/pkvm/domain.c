@@ -271,6 +271,7 @@ struct dmar_domain *pkvm_alloc_iommu_domain(struct alloc_domain_data *data,
 		domain->max_addr = data->max_addr;
 		domain->index = index;
 		domain->qi_batch = &domain->_qi_batch;
+		domain->vm_handle = PKVM_DOMAIN_UNBOUND; // initialize vm_handle to unbound
 		atomic_set(&domain->refcount, 1);
 		pkvm_spin_lock_init(&domain->lock);
 		pkvm_spin_lock_init(&domain->cache_lock);
@@ -288,7 +289,7 @@ static int iommu_domain_map(struct domain_map_data *data)
 {
 	struct dmar_domain *domain;
 	u64 iova, phys, size, end;
-	int ret;
+	int ret, hpa_vm, owner;
 
 	/* Check for possible overflows that may have security implications */
 	if (check_shl_overflow(data->iov_pfn, VTD_PAGE_SHIFT, &iova))
@@ -309,25 +310,28 @@ static int iommu_domain_map(struct domain_map_data *data)
 		return -EINVAL;
 	}
 
-	{
-		int hpa_vm = pkvm_lookup_hpa_vm(phys, phys + size);
-		if (hpa_vm < 0) {
-			pkvm_err("%s: HPA [0x%llx, 0x%llx) not in any VM mapping\n",
-				 __func__, phys, phys + size);
-			pkvm_put_iommu_domain(domain);
-			return -EPERM;
-		}
-		if (domain->vm_handle == 0) {
-			domain->vm_handle = hpa_vm;
-		} else if (domain->vm_handle != hpa_vm) {
-			pkvm_err("%s: cross-VM mapping! domain->vm_handle=%d hpa_vm=%d\n",
-				 __func__, domain->vm_handle, hpa_vm);
-			pkvm_put_iommu_domain(domain);
-			return -EPERM;
-		}
+	/* Only a completely unregistered HPA range belongs to the host. */
+	hpa_vm = pkvm_lookup_hpa_vm(phys, phys + size);
+	if (hpa_vm == -ENOENT)
+		owner = PKVM_DOMAIN_HOST;
+	else if (hpa_vm >= 0)
+		owner = hpa_vm;
+	else {
+		pkvm_err("%s: invalid HPA range [0x%llx, 0x%llx), err=%d\n",
+			 __func__, phys, phys + size, hpa_vm);
+		pkvm_put_iommu_domain(domain);
+		return -EPERM;
 	}
 
 	pkvm_spin_lock(&domain->lock);
+	if (domain->vm_handle == PKVM_DOMAIN_UNBOUND)
+		domain->vm_handle = owner;
+	if (domain->vm_handle != owner) {
+		pkvm_err("%s: domain owner=%d, HPA owner=%d\n",
+			 __func__, domain->vm_handle, owner);
+		ret = -EPERM;
+		goto out_unlock;
+	}
 	if (data->mc.count) {
 		ret = refill_domain_memcache(domain, &data->mc);
 		if (ret) {
@@ -394,7 +398,7 @@ int pkvm_iommu_attach_ptdev(u16 bdf, int vm_handle)
 			if (domain->pending_bdfs[j] == bdf) {
 				domain->pending_bdfs[j] =
 					domain->pending_bdfs[--domain->pending_count];
-				if (domain->vm_handle == 0) {
+				if (domain->vm_handle == PKVM_DOMAIN_UNBOUND || domain->vm_handle == PKVM_DOMAIN_HOST) {
 					domain->vm_handle = vm_handle;
 				} else if (domain->vm_handle != vm_handle) {
 					pkvm_err("%s: cross-VM attach! domain->vm_handle=%d vm_handle=%d\n",
