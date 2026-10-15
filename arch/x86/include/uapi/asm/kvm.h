@@ -976,6 +976,9 @@ struct kvm_hyperv_eventfd {
 #define KVM_CAP_X86_PROTECTED_VM_FLAGS_SET_FW_GPA	0
 #define KVM_CAP_X86_PROTECTED_VM_FLAGS_INFO		1
 #define KVM_CAP_X86_PROTECTED_VM_FLAGS_SET_PTDEV_MMIO_METADATA 2
+#define KVM_CAP_X86_PROTECTED_VM_FLAGS_SET_PTDEV_PCI_ID	3
+
+#define KVM_PROTECTED_VM_PTDEV_PCI_ID_VERSION		1
 
 #define KVM_PROTECTED_VM_PTDEV_MMIO_MAX_RANGES		16
 
@@ -1004,6 +1007,17 @@ struct kvm_protected_vm_ptdev_mmio_metadata {
 	__u32 flags;
 	__u64 ranges;
 	__u64 __reserved[4];
+};
+
+/* Register a guest PCI address for an already assigned passthrough device. */
+struct kvm_protected_vm_ptdev_pci_id {
+	__u32 version;
+	__u32 flags;
+	__u16 host_segment;
+	__u16 host_bdf;
+	__u16 guest_segment;
+	__u16 guest_bdf;
+	__u32 reserved[2];
 };
 
 /* Trust Domain eXtension sub-ioctl() commands. */

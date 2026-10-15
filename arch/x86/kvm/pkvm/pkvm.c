@@ -2139,6 +2139,24 @@ static int pkvm_hc_remove_ptdev(int vm_handle, u16 bdf)
 	return ret;
 }
 
+static int pkvm_hc_register_ptdev_pci_id(int vm_handle, u64 host_id, u64 guest_id)
+{
+	struct pkvm_vm *vm;
+	int ret;
+
+	vm = pkvm_get_vm(vm_handle);
+	if (!vm)
+		return -EINVAL;
+
+	if (pkvm_is_protected_vm(&vm->kvm))
+		ret = pkvm_register_ptdev_pci_id(vm, host_id, guest_id);
+	else
+		ret = -EINVAL;
+
+	pkvm_put_vm(vm);
+	return ret;
+}
+
 static int pkvm_hc_register_hpa_vm(u64 hpa_start, u64 hpa_end, int vm_handle)
 {
 	return pkvm_register_hpa_vm(hpa_start, hpa_end, vm_handle);
@@ -2324,6 +2342,11 @@ void pkvm_handle_host_hypercall(struct kvm_vcpu *vcpu)
 	case __pkvm__remove_ptdev:
 		ret = pkvm_hc_remove_ptdev(pkvm_hc_input1(vcpu),
 					   (u16)pkvm_hc_input2(vcpu));
+		break;
+	case __pkvm__register_ptdev_pci_id:
+		ret = pkvm_hc_register_ptdev_pci_id(pkvm_hc_input1(vcpu),
+						 pkvm_hc_input2(vcpu),
+						 pkvm_hc_input3(vcpu));
 		break;
 	case __pkvm__sync_ptdev_mmio_metadata:
 		ret = pkvm_hc_sync_ptdev_mmio_metadata(pkvm_hc_input1(vcpu));

@@ -51,6 +51,10 @@ struct pkvm_ptdev {
 	atomic_t refcount;
 	struct hlist_node hnode;
 	u16 bdf;
+	/* Guest identity is protected by the owning VM's lock while linked. */
+	u16 guest_segment;
+	u16 guest_bdf;
+	bool guest_pci_id_valid;
 	unsigned long index;
 
 	pkvm_spinlock_t lock;
@@ -75,6 +79,7 @@ void pkvm_put_ptdev(struct pkvm_ptdev *ptdev);
 void pkvm_detach_ptdev(struct pkvm_ptdev *ptdev, struct pkvm_vm *vm);
 int pkvm_attach_ptdev(u16 bdf, struct pkvm_vm *vm);
 int pkvm_remove_ptdev(u16 bdf, struct pkvm_vm *vm);
+int pkvm_register_ptdev_pci_id(struct pkvm_vm *vm, u64 host_id, u64 guest_id);
 void pkvm_vm_destroy_ptdevs(struct pkvm_vm *vm);
 int pkvm_set_ptdev_mmio_metadata(struct pkvm_vm *vm,
 				 const struct kvm_ptdev_mmio_metadata *metadata);

@@ -40,6 +40,9 @@ static struct pkvm_ptdev *__pkvm_alloc_ptdev_locked(u16 bdf)
 		__set_bit(index, ptdevs_bitmap);
 		ptdev = &pkvm_ptdev[index];
 		ptdev->bdf = bdf;
+		ptdev->guest_segment = 0;
+		ptdev->guest_bdf = 0;
+		ptdev->guest_pci_id_valid = false;
 		ptdev->index = index;
 		ptdev->owner = PKVM_PTDEV_OWNER_HOST;
 		ptdev->assignment_state = PKVM_PTDEV_DETACHED;
@@ -426,7 +429,13 @@ void pkvm_detach_ptdev(struct pkvm_ptdev *ptdev, struct pkvm_vm *vm)
 		return;
 	}
 
+	/* Drop the guest identity before the device can be assigned again. */
+	pkvm_spin_lock(&vm->lock);
+	ptdev->guest_pci_id_valid = false;
+	ptdev->guest_segment = 0;
+	ptdev->guest_bdf = 0;
 	ptdev->vm_handle = PKVM_PTDEV_VM_UNBOUND;
+	pkvm_spin_unlock(&vm->lock);
 	ptdev->mmio_metadata_valid = false;
 	ptdev->guest_contract_published = false;
 	memset(&ptdev->mmio_metadata, 0, sizeof(ptdev->mmio_metadata));
@@ -623,6 +632,89 @@ int pkvm_attach_ptdev(u16 bdf, struct pkvm_vm *vm)
 	}
 
 	return 0;
+}
+
+/* Caller holds vm->lock to keep the registered mapping list stable. */
+static void pkvm_dump_ptdev_pci_ids_locked(struct pkvm_vm *vm)
+{
+	struct pkvm_ptdev *ptdev;
+	int vm_handle = vm->kvm.arch.pkvm.handle;
+	unsigned int count = 0;
+
+	pkvm_info("ptdev-pci-id: vm=%d dev-list begin\n", vm_handle);
+	list_for_each_entry(ptdev, &vm->ptdev_head, vm_node) {
+		if (!ptdev->guest_pci_id_valid)
+			continue;
+
+		pkvm_info("ptdev-pci-id: vm=%d entry=%u host=0000:%02x:%02x.%x guest=%04x:%02x:%02x.%x\n",
+			  vm_handle, count++, ptdev->bdf >> 8,
+			  (ptdev->bdf >> 3) & 0x1f, ptdev->bdf & 0x7,
+			  ptdev->guest_segment, ptdev->guest_bdf >> 8,
+			  (ptdev->guest_bdf >> 3) & 0x1f,
+			  ptdev->guest_bdf & 0x7);
+	}
+	pkvm_info("ptdev-pci-id: vm=%d dev-list end entries=%u\n",
+		  vm_handle, count);
+}
+
+int pkvm_register_ptdev_pci_id(struct pkvm_vm *vm, u64 host_id, u64 guest_id)
+{
+	struct pkvm_ptdev *ptdev, *other;
+	u16 guest_segment, guest_bdf;
+	int ret = 0;
+
+	/* Physical ptdev lookup currently supports only PCI segment zero. */
+	if (host_id > U16_MAX || guest_id > U32_MAX)
+		return -EINVAL;
+
+	guest_segment = guest_id >> 16;
+	guest_bdf = guest_id;
+	ptdev = pkvm_get_ptdev(host_id);
+	if (!ptdev)
+		return -ENODEV;
+
+	/* Keep the existing ptdev -> VM lock order used by BAR publication. */
+	pkvm_spin_lock(&ptdev->lock);
+	pkvm_spin_lock(&vm->lock);
+	if (vm->kvm.arch.pkvm.finalized) {
+		ret = -EBUSY;
+		goto out;
+	}
+	if (ptdev->vm_handle != vm->kvm.arch.pkvm.handle) {
+		ret = -EPERM;
+		goto out;
+	}
+	if (ptdev->assignment_state != PKVM_PTDEV_GUEST_ASSIGNED ||
+	    !ptdev->guest_contract_published) {
+		ret = -EAGAIN;
+		goto out;
+	}
+	if (ptdev->guest_pci_id_valid) {
+		ret = ptdev->guest_segment == guest_segment &&
+		      ptdev->guest_bdf == guest_bdf ? 0 : -EBUSY;
+		goto out;
+	}
+
+	/* vm->lock serializes duplicate checks, publication and finalize. */
+	list_for_each_entry(other, &vm->ptdev_head, vm_node) {
+		if (other != ptdev && other->guest_pci_id_valid &&
+		    other->guest_segment == guest_segment &&
+		    other->guest_bdf == guest_bdf) {
+			ret = -EBUSY;
+			goto out;
+		}
+	}
+
+	ptdev->guest_segment = guest_segment;
+	ptdev->guest_bdf = guest_bdf;
+	ptdev->guest_pci_id_valid = true;
+out:
+	if (!ret)
+		pkvm_dump_ptdev_pci_ids_locked(vm);
+	pkvm_spin_unlock(&vm->lock);
+	pkvm_spin_unlock(&ptdev->lock);
+	pkvm_put_ptdev(ptdev);
+	return ret;
 }
 
 int pkvm_remove_ptdev(u16 bdf, struct pkvm_vm *vm)
