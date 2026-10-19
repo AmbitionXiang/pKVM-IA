@@ -279,7 +279,8 @@ static int pkvm_split_msix_excluded_ranges(struct kvm_ptdev_mmio_metadata *kmeta
 	u32 table, pba;
 	u8 msix_pos;
 	u16 ctrl;
-	u16 i, j;
+	int i;
+	u16 j;
 
 	pdev = pci_get_domain_bus_and_slot(kmeta->segment,
 					   PCI_BUS_NUM(kmeta->bdf),
@@ -301,7 +302,7 @@ static int pkvm_split_msix_excluded_ranges(struct kvm_ptdev_mmio_metadata *kmeta
 
 	pba_bar = pba & PCI_MSIX_TABLE_BIR;
 	pba_offset = pba & PCI_MSIX_TABLE_OFFSET;
-	pba_size = 8;
+	pba_size = ALIGN(DIV_ROUND_UP((ctrl & PCI_MSIX_FLAGS_QSIZE) + 1, 8), 8);
 
 	for (i = 0; i < kmeta->nr_ranges; i++) {
 		struct kvm_protected_vm_ptdev_mmio_range *range = &kmeta->ranges[i];
@@ -316,25 +317,44 @@ static int pkvm_split_msix_excluded_ranges(struct kvm_ptdev_mmio_metadata *kmeta
 		range_end = range->bar_offset + range->size;
 
 		if (range->bar_index == msix_bar) {
-			excl_start = msix_offset;
-			excl_end = msix_offset + msix_size;
-			if (excl_start < range_end && excl_end > range_start)
+			u64 s = ALIGN_DOWN((u64)msix_offset, PAGE_SIZE);
+			u64 e = ALIGN((u64)msix_offset + msix_size, PAGE_SIZE);
+			if (s < range_end && e > range_start) {
+				excl_start = s;
+				excl_end = e;
 				need_split = true;
+			}
 		}
 
-		if (range->bar_index == pba_bar && !need_split) {
-			excl_start = pba_offset;
-			excl_end = pba_offset + pba_size;
-			if (excl_start < range_end && excl_end > range_start)
+		if (range->bar_index == pba_bar) {
+			u64 s = ALIGN_DOWN((u64)pba_offset, PAGE_SIZE);
+			u64 e = ALIGN((u64)pba_offset + pba_size, PAGE_SIZE);
+			if (s < range_end && e > range_start) {
+				if (!need_split) {
+					excl_start = s;
+					excl_end = e;
+				} else {
+					excl_start = min_t(u64, excl_start, s);
+					excl_end = max_t(u64, excl_end, e);
+				}
 				need_split = true;
+			}
 		}
 
 		if (!need_split)
 			continue;
 
-		if (kmeta->nr_ranges + 1 > KVM_PROTECTED_VM_PTDEV_MMIO_MAX_RANGES) {
-			pci_dev_put(pdev);
-			return -ENOSPC;
+		if (excl_start < range_start)
+			excl_start = range_start;
+		if (excl_end > range_end)
+			excl_end = range_end;
+
+		if (excl_start <= range_start && excl_end >= range_end) {
+			for (j = i; j < kmeta->nr_ranges - 1; j++)
+				kmeta->ranges[j] = kmeta->ranges[j + 1];
+			kmeta->nr_ranges--;
+			i--;
+			continue;
 		}
 
 		if (excl_start > range_start) {
@@ -342,18 +362,26 @@ static int pkvm_split_msix_excluded_ranges(struct kvm_ptdev_mmio_metadata *kmeta
 
 			range->size = excl_start - range_start;
 
-			for (j = kmeta->nr_ranges; j > i + 1; j--)
-				kmeta->ranges[j] = kmeta->ranges[j - 1];
+			if (excl_end < orig_end) {
+				if (kmeta->nr_ranges + 1 >
+				    KVM_PROTECTED_VM_PTDEV_MMIO_MAX_RANGES) {
+					pci_dev_put(pdev);
+					return -ENOSPC;
+				}
 
-			kmeta->ranges[i + 1].bar_index = range->bar_index;
-			kmeta->ranges[i + 1].bar_offset = excl_end;
-			kmeta->ranges[i + 1].size = orig_end - excl_end;
-			kmeta->ranges[i + 1].guest_gpa =
-				range->guest_gpa + (excl_end - range_start);
-			kmeta->ranges[i + 1].kind =
-				KVM_PROTECTED_VM_PTDEV_MMIO_KIND_DIRECT_BAR;
-			kmeta->nr_ranges++;
-			i++;
+				for (j = kmeta->nr_ranges; j > i + 1; j--)
+					kmeta->ranges[j] = kmeta->ranges[j - 1];
+
+				kmeta->ranges[i + 1].bar_index = range->bar_index;
+				kmeta->ranges[i + 1].bar_offset = excl_end;
+				kmeta->ranges[i + 1].size = orig_end - excl_end;
+				kmeta->ranges[i + 1].guest_gpa =
+					range->guest_gpa + (excl_end - range_start);
+				kmeta->ranges[i + 1].kind =
+					KVM_PROTECTED_VM_PTDEV_MMIO_KIND_DIRECT_BAR;
+				kmeta->nr_ranges++;
+				i++;
+			}
 		} else {
 			range->bar_offset = excl_end;
 			range->size = range_end - excl_end;
