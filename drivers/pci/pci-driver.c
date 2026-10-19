@@ -1624,6 +1624,10 @@ static int pci_bus_num_vf(struct device *dev)
 	return pci_num_vf(to_pci_dev(dev));
 }
 
+void __weak arch_pci_set_private_dma_allowed(struct pci_dev *pdev)
+{
+}
+
 /**
  * pci_dma_configure - Setup DMA configuration
  * @dev: ptr to dev structure
@@ -1656,6 +1660,9 @@ static int pci_dma_configure(struct device *dev)
 		if (ret)
 			arch_teardown_dma_ops(dev);
 	}
+
+	if (!ret)
+		arch_pci_set_private_dma_allowed(to_pci_dev(dev));
 
 	return ret;
 }

@@ -2,6 +2,7 @@
 
 #include <linux/kvm_para.h>
 #include <linux/io.h>
+#include <linux/pci.h>
 #include <linux/uaccess.h>
 #include <asm/coco.h>
 #include <asm/pkvm_guest.h>
@@ -18,6 +19,61 @@ static struct pkvm_guest_mmio_info pkvm_mmio_info;
 static struct pkvm_guest_mmio_allow_range
 	pkvm_mmio_allow_ranges[PKVM_GUEST_MMIO_ALLOW_MAX_RANGES];
 static u16 pkvm_mmio_allow_nr_ranges;
+
+static struct pkvm_guest_ptdev_pci_id
+	pkvm_private_dma_list[PKVM_GUEST_PTDEV_MAX_DEVS] __ro_after_init;
+static unsigned int pkvm_private_dma_nr_entries __ro_after_init;
+
+static void __init pkvm_init_private_dma_list(void)
+{
+	unsigned int i;
+	long ret;
+
+	/* Touch the buffer so its pages are donated before the call. */
+	memset(pkvm_private_dma_list, 0, sizeof(pkvm_private_dma_list));
+	pkvm_private_dma_nr_entries = 0;
+
+	ret = kvm_hypercall2(PKVM_GHC_PTDEV_PCI_LIST, __pa(pkvm_private_dma_list),
+			     ARRAY_SIZE(pkvm_private_dma_list));
+	if (ret < 0 || ret > ARRAY_SIZE(pkvm_private_dma_list)) {
+		memset(pkvm_private_dma_list, 0, sizeof(pkvm_private_dma_list));
+		return;
+	}
+
+	pkvm_private_dma_nr_entries = ret;
+	for (i = 0; i < pkvm_private_dma_nr_entries; i++) {
+		struct pkvm_guest_ptdev_pci_id *id =
+			&pkvm_private_dma_list[i];
+
+		pr_info("pkvm: received ptdev vBDF=%04x:%02x:%02x.%x\n",
+			id->guest_segment, id->guest_bdf >> 8,
+			(id->guest_bdf >> 3) & 0x1f, id->guest_bdf & 0x7);
+	}
+}
+
+#if defined(CONFIG_PCI) && defined(CONFIG_SWIOTLB)
+static bool pkvm_private_dma_list_contains(int segment, u16 bdf)
+{
+	unsigned int i;
+
+	if (segment < 0 || segment > U16_MAX)
+		return false;
+
+	for (i = 0; i < pkvm_private_dma_nr_entries; i++) {
+		if (pkvm_private_dma_list[i].guest_segment == segment &&
+		    pkvm_private_dma_list[i].guest_bdf == bdf)
+			return true;
+	}
+	return false;
+}
+
+void arch_pci_set_private_dma_allowed(struct pci_dev *pdev)
+{
+	pdev->dev.private_dma_allowed = pkvm_is_protected_guest() &&
+		pkvm_private_dma_list_contains(pci_domain_nr(pdev->bus),
+					     PCI_DEVID(pdev->bus->number, pdev->devfn));
+}
+#endif
 
 int pkvm_set_mem_host_visibility(unsigned long addr, int numpages, bool enc)
 {
@@ -259,6 +315,7 @@ __init void pkvm_guest_init_coco(void)
 	static_branch_enable(&pkvm_guest_detected);
 
 	pkvm_init_mmio_allowlist();
+	pkvm_init_private_dma_list();
 
 	pv_ops.mmio.raw_readb = pkvm_mmio_readb;
 	pv_ops.mmio.raw_readw = pkvm_mmio_readw;
