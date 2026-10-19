@@ -367,6 +367,7 @@ void __init swiotlb_init_remap(bool addressing_limit, unsigned int flags,
 
 	io_tlb_default_mem.force_bounce =
 		swiotlb_force_bounce || (flags & SWIOTLB_FORCE);
+	io_tlb_default_mem.force_bounce_shared = !!(flags & SWIOTLB_FORCE_SHARED);
 
 #ifdef CONFIG_SWIOTLB_DYNAMIC
 	if (!remap)
