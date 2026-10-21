@@ -442,6 +442,35 @@ out:
 	return ret;
 }
 
+static int pkvm_vm_ioctl_set_ptdev_pci_id(
+	struct kvm *kvm, struct kvm_protected_vm_ptdev_pci_id __user *user_id)
+{
+	struct kvm_pkvm_vm *pkvm = &kvm->arch.pkvm;
+	struct kvm_protected_vm_ptdev_pci_id id;
+	u32 host_id, guest_id;
+	int ret;
+
+	if (copy_from_user(&id, user_id, sizeof(id)))
+		return -EFAULT;
+
+	if (id.version != KVM_PROTECTED_VM_PTDEV_PCI_ID_VERSION ||
+	    id.flags || id.host_segment || id.reserved[0] || id.reserved[1])
+		return -EINVAL;
+
+	host_id = ((u32)id.host_segment << 16) | id.host_bdf;
+	guest_id = ((u32)id.guest_segment << 16) | id.guest_bdf;
+
+	mutex_lock(&pkvm->finalized_lock);
+	if (pkvm->finalized)
+		ret = -EBUSY;
+	else
+		ret = pkvm_hypercall(register_ptdev_pci_id, pkvm->handle,
+				    host_id, guest_id);
+	mutex_unlock(&pkvm->finalized_lock);
+
+	return ret;
+}
+
 static int add_device_to_pkvm(struct device *dev, void *data)
 {
 	struct kvm *kvm = data;
@@ -541,6 +570,9 @@ int pkvm_vm_ioctl_enable_cap(struct kvm *kvm, struct kvm_enable_cap *cap)
 	case KVM_CAP_X86_PROTECTED_VM_FLAGS_INFO:
 		return pkvm_vm_ioctl_info(kvm, (void __force __user *)cap->args[0]);
 #ifdef CONFIG_PKVM_INTEL
+	case KVM_CAP_X86_PROTECTED_VM_FLAGS_SET_PTDEV_PCI_ID:
+		return pkvm_vm_ioctl_set_ptdev_pci_id(kvm,
+				(void __force __user *)cap->args[0]);
 	case KVM_CAP_X86_PROTECTED_VM_FLAGS_SET_PTDEV_MMIO_METADATA:
 		return pkvm_vm_ioctl_set_ptdev_mmio_metadata(kvm,
 				(void __force __user *)cap->args[0]);

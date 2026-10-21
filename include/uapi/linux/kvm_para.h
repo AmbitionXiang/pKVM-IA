@@ -45,6 +45,19 @@
 #define PKVM_GHC_PTDEV_MMIO_INFO	PKVM_GHC_NUM(6)
 #define PKVM_GHC_PTDEV_MMIO_READ	PKVM_GHC_NUM(7)
 #define PKVM_GHC_GET_VE_GPA		PKVM_GHC_NUM(8)
+#define PKVM_GHC_PTDEV_PCI_LIST		PKVM_GHC_NUM(9)
+
+#define PKVM_GUEST_PTDEV_MAX_DEVS		16
+
+/*
+ * PTDEV_PCI_LIST: a0 = array GPA, a1 = capacity in entries.
+ * Returns the number of entries written, or a negative error.
+ * Insufficient capacity returns -E2BIG without writing a partial list.
+ */
+struct pkvm_guest_ptdev_pci_id {
+	__u16 guest_segment;
+	__u16 guest_bdf;
+};
 
 #define PKVM_GUEST_MMIO_ALLOW_MAX_RANGES	16
 #define PKVM_GUEST_MMIO_ALLOW_FLAG_DIRECT_BAR	(1U << 0)

@@ -367,6 +367,7 @@ void __init swiotlb_init_remap(bool addressing_limit, unsigned int flags,
 
 	io_tlb_default_mem.force_bounce =
 		swiotlb_force_bounce || (flags & SWIOTLB_FORCE);
+	io_tlb_default_mem.force_bounce_partial = !!(flags & SWIOTLB_FORCE_PARTIAL);
 
 #ifdef CONFIG_SWIOTLB_DYNAMIC
 	if (!remap)
@@ -820,6 +821,7 @@ static void swiotlb_del_pool(struct device *dev, struct io_tlb_pool *pool)
 void swiotlb_dev_init(struct device *dev)
 {
 	dev->dma_io_tlb_mem = &io_tlb_default_mem;
+	dev->private_dma_allowed = false;
 #ifdef CONFIG_SWIOTLB_DYNAMIC
 	INIT_LIST_HEAD(&dev->dma_io_tlb_pools);
 	spin_lock_init(&dev->dma_io_tlb_lock);

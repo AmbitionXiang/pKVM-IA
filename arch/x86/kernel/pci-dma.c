@@ -13,6 +13,7 @@
 #include <asm/dma.h>
 #include <asm/iommu.h>
 #include <asm/gart.h>
+#include <asm/pkvm_guest.h>
 #include <asm/x86_init.h>
 
 #include <xen/xen.h>
@@ -55,13 +56,13 @@ static void __init pci_swiotlb_detect(void)
 		x86_swiotlb_enable = true;
 
 	/*
-	 * Guest with guest memory encryption currently perform all DMA through
-	 * bounce buffers as the hypervisor can't access arbitrary VM memory
-	 * that is not explicitly shared with it.
+	 * Guests with private memory use shared bounce buffers for DMA.
+	 * pKVM allows devices on its private DMA list to bypass this requirement.
 	 */
 	if (cc_platform_has(CC_ATTR_GUEST_MEM_ENCRYPT)) {
 		x86_swiotlb_enable = true;
-		x86_swiotlb_flags |= SWIOTLB_FORCE;
+		x86_swiotlb_flags |= pkvm_is_protected_guest() ?
+				     SWIOTLB_FORCE_PARTIAL : SWIOTLB_FORCE;
 	}
 }
 #else

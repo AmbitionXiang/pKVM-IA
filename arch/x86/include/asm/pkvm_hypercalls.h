@@ -113,6 +113,7 @@ PKVM_HC(add_ptdev)
 PKVM_HC(remove_ptdev)
 PKVM_HC(sync_ptdev_mmio_metadata)
 PKVM_HC(register_hpa_vm)
+PKVM_HC(register_ptdev_pci_id)
 #endif
 
 #undef PKVM_HC
