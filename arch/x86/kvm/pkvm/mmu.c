@@ -862,6 +862,9 @@ int pkvm_host_mmu_init(void *pool_base, unsigned long pool_pages,
 	/* Map holes between memblocks as MMIO with RWX permissions */
 	for (i = phys = 0; i < pkvm_memblock_nr; i++, phys = reg->base + reg->size) {
 		reg = &pkvm_memory[i];
+		if (reg->base == phys)
+			continue;
+
 		ret = host_mmu_map(phys, (unsigned long)reg->base - phys, true);
 		if (ret)
 			return ret;
