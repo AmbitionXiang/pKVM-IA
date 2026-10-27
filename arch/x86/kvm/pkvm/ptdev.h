@@ -76,7 +76,7 @@ struct pkvm_ptdev {
 
 struct pkvm_ptdev *pkvm_get_ptdev(u16 bdf);
 void pkvm_put_ptdev(struct pkvm_ptdev *ptdev);
-void pkvm_detach_ptdev(struct pkvm_ptdev *ptdev, struct pkvm_vm *vm);
+int pkvm_detach_ptdev(struct pkvm_ptdev *ptdev, struct pkvm_vm *vm);
 int pkvm_attach_ptdev(u16 bdf, struct pkvm_vm *vm);
 int pkvm_remove_ptdev(u16 bdf, struct pkvm_vm *vm);
 int pkvm_register_ptdev_pci_id(struct pkvm_vm *vm, u64 host_id, u64 guest_id);

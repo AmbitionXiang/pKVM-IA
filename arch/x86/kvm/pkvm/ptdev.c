@@ -415,7 +415,8 @@ static int pkvm_publish_ptdev_mmio_contract_locked(struct pkvm_vm *vm,
 static void pkvm_withdraw_ptdev_mmio_contract_locked(struct pkvm_vm *vm,
 						     struct pkvm_ptdev *ptdev);
 
-void pkvm_detach_ptdev(struct pkvm_ptdev *ptdev, struct pkvm_vm *vm)
+/* A successful detach drops the reference retained by attach. */
+int pkvm_detach_ptdev(struct pkvm_ptdev *ptdev, struct pkvm_vm *vm)
 {
 	int ret;
 
@@ -426,7 +427,7 @@ void pkvm_detach_ptdev(struct pkvm_ptdev *ptdev, struct pkvm_vm *vm)
 		pkvm_err("pkvm: detach ptdev restore failed bdf=0x%x ret=%d\n",
 			 ptdev->bdf, ret);
 		pkvm_spin_unlock(&ptdev->lock);
-		return;
+		return ret;
 	}
 
 	/* Drop the guest identity before the device can be assigned again. */
@@ -444,6 +445,7 @@ void pkvm_detach_ptdev(struct pkvm_ptdev *ptdev, struct pkvm_vm *vm)
 	pkvm_vm_unlink_ptdev(vm, &ptdev->vm_node);
 
 	pkvm_put_ptdev(ptdev);
+	return 0;
 }
 
 static u64 pkvm_host_ept_mmio_prot(void)
@@ -721,6 +723,7 @@ int pkvm_remove_ptdev(u16 bdf, struct pkvm_vm *vm)
 {
 	struct pkvm_ptdev *ptdev;
 	int vm_handle;
+	int ret;
 
 	ptdev = pkvm_get_ptdev(bdf);
 	if (!ptdev)
@@ -736,8 +739,10 @@ int pkvm_remove_ptdev(u16 bdf, struct pkvm_vm *vm)
 	}
 	pkvm_spin_unlock(&ptdev->lock);
 
-	pkvm_detach_ptdev(ptdev, vm);
-	return 0;
+	ret = pkvm_detach_ptdev(ptdev, vm);
+	/* Drop the lookup reference, even if detach failed. */
+	pkvm_put_ptdev(ptdev);
+	return ret;
 }
 
 void pkvm_vm_destroy_ptdevs(struct pkvm_vm *vm)
