@@ -535,6 +535,8 @@ static int host_reclaim_guest_walker(struct pkvm_pgtable_visit_ctx *ctx,
 	}
 
 	if (pkvm_is_protected_vm(kvm)) {
+		/* Clear the association before ownership/access returns to the host. */
+		pkvm_clear_hpa_backing(phys, size, kvm->arch.pkvm.handle);
 		/*
 		 * pkvm_pgtable_map() shouldn't fail here unless there is a bug.
 		 * See also comment in pkvm_hyp_donate_host().
@@ -1491,6 +1493,9 @@ int pkvm_host_donate_guest(struct kvm_vcpu *vcpu, unsigned long gpa,
 	 */
 	{
 		int hpa_vm = pkvm_lookup_hpa_vm(hpa, hpa + size);
+
+		if (hpa_vm >= 0)
+			pkvm_put_vm_handle(hpa_vm);
 		if (hpa_vm != pkvm_vm->kvm.arch.pkvm.handle) {
 			kvm_err("pkvm: donate: HPA [0x%lx, 0x%lx) not in VM %d (got %d)\n",
 				hpa, hpa + size, pkvm_vm->kvm.arch.pkvm.handle, hpa_vm);
@@ -1862,6 +1867,7 @@ unlock:
  */
 int pkvm_host_use_dma(unsigned long phys, unsigned long size)
 {
+	int vm_handle = -ENOENT;
 	int ret;
 
 	if (!is_valid_addr_range(phys, size, true))
@@ -1877,16 +1883,20 @@ int pkvm_host_use_dma(unsigned long phys, unsigned long size)
 		 *   → vm_handle >= 0, pages OWNED, owner=HOST.
 		 * viommu:  map after HPA register, after donate
 		 *   → vm_handle >= 0, pages NONE, owner=GUEST.
-		 * host DMA (non-pVM): vm_handle < 0, pages OWNED, owner=HOST.
+		 * host DMA (non-pVM): -ENOENT, pages OWNED, owner=HOST.
+		 * Other lookup errors, including a detached VM, reject DMA.
 		 */
-		int vm_handle = pkvm_lookup_hpa_vm(phys, phys + size);
+		vm_handle = pkvm_lookup_hpa_vm(phys, phys + size);
 
-		if (vm_handle < 0) {
+		if (vm_handle == -ENOENT) {
 			/* HPA not in any VM: host DMA, original logic. */
 			ret = check_host_mem_pgstate_mask(phys, size,
 							  BIT(PKVM_PAGE_OWNED) |
 							  BIT(PKVM_PAGE_SHARED_OWNED),
 							  PKVM_ID_HOST, false);
+		} else if (vm_handle < 0) {
+			/* Never interpret a mixed/invalid range as ordinary host DMA. */
+			ret = -EPERM;
 		} else {
 			/* HPA belongs to a VM.  Try HOST-owned first
 			 * (NoIommu, before donate). */
@@ -1954,6 +1964,8 @@ int pkvm_host_use_dma(unsigned long phys, unsigned long size)
 	}
 unlock:
 	pkvm_host_mmu_unlock();
+	if (vm_handle >= 0)
+		pkvm_put_vm_handle(vm_handle);
 
 	return ret;
 }

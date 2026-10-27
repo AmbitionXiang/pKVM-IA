@@ -350,6 +350,8 @@ static int iommu_domain_map(struct domain_map_data *data)
 
 out_unlock:
 	pkvm_spin_unlock(&domain->lock);
+	if (hpa_vm >= 0)
+		pkvm_put_vm_handle(hpa_vm);
 	pkvm_put_iommu_domain(domain);
 
 	return ret;

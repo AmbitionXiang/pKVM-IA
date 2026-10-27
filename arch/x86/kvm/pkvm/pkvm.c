@@ -48,9 +48,6 @@ unsigned long kaslr_offset_val;
  */
 struct x86_pmu_capability __read_mostly kvm_pmu_cap = {0};
 
-/* The maximum number of VMs under pkvm. */
-#define MAX_PKVM_VMS		64
-
 static DECLARE_BITMAP(pkvm_vms_bitmap, MAX_PKVM_VMS);
 static DEFINE_PKVM_SPINLOCK(pkvm_vms_lock);
 static struct pkvm_vm_ref {
@@ -103,7 +100,7 @@ static int allocate_pkvm_vm_handle(struct pkvm_vm *pkvm_vm)
 	return idx;
 }
 
-static struct pkvm_vm *free_pkvm_vm_handle(int handle)
+static struct pkvm_vm *detach_pkvm_vm_handle(int handle)
 {
 	struct pkvm_vm_ref *pkvm_vm_ref;
 	struct pkvm_vm *pkvm_vm;
@@ -127,10 +124,22 @@ static struct pkvm_vm *free_pkvm_vm_handle(int handle)
 	BUG_ON(!pkvm_vm);
 	pkvm_vm_ref->pkvm_vm = NULL;
 
-	__clear_bit(idx, pkvm_vms_bitmap);
+	/* Reserve the handle until all old backing associations are gone. */
 
 	pkvm_spin_unlock(&pkvm_vms_lock);
 	return pkvm_vm;
+}
+
+static void release_pkvm_vm_handle(int handle)
+{
+	pkvm_spin_lock(&pkvm_vms_lock);
+	if (WARN_ON_ONCE(atomic_read(&pkvm_vms_ref[handle].refcount) ||
+			 pkvm_vms_ref[handle].pkvm_vm)) {
+		pkvm_spin_unlock(&pkvm_vms_lock);
+		return;
+	}
+	__clear_bit(handle, pkvm_vms_bitmap);
+	pkvm_spin_unlock(&pkvm_vms_lock);
 }
 
 static int pkvm_vm_init(phys_addr_t host_kvm_pa, phys_addr_t pkvm_vm_pa,
@@ -175,7 +184,6 @@ static int pkvm_vm_init(phys_addr_t host_kvm_pa, phys_addr_t pkvm_vm_pa,
 
 	pkvm_spin_lock_init(&pkvm_vm->lock);
 	INIT_LIST_HEAD(&pkvm_vm->ptdev_head);
-	INIT_LIST_HEAD(&pkvm_vm->hpa_range_head);
 
 	ret = pkvm_guest_mmu_init(pkvm_vm, pgd_pa);
 	if (ret)
@@ -192,7 +200,8 @@ static int pkvm_vm_init(phys_addr_t host_kvm_pa, phys_addr_t pkvm_vm_pa,
 	return kvm->arch.pkvm.handle;
 
 free_handle:
-	free_pkvm_vm_handle(kvm->arch.pkvm.handle);
+	detach_pkvm_vm_handle(kvm->arch.pkvm.handle);
+	release_pkvm_vm_handle(kvm->arch.pkvm.handle);
 mmu_destroy:
 	pkvm_guest_mmu_destroy(pkvm_vm);
 undonate:
@@ -221,7 +230,7 @@ static void teardown_donated_memory(struct pkvm_memcache *mc, void *addr, size_t
 
 static int pkvm_vm_destroy(int vm_handle, struct pkvm_memcache *mc)
 {
-	struct pkvm_vm *pkvm_vm = free_pkvm_vm_handle(vm_handle);
+	struct pkvm_vm *pkvm_vm = detach_pkvm_vm_handle(vm_handle);
 	unsigned long shared_kvm_pa;
 	int i;
 
@@ -242,12 +251,15 @@ static int pkvm_vm_destroy(int vm_handle, struct pkvm_memcache *mc)
 
 #ifdef CONFIG_PKVM_INTEL
 	pkvm_vm_destroy_ptdevs(pkvm_vm);
-	pkvm_destroy_hpa_ranges(pkvm_vm);
 #endif
 
 	kvm_x86_call(vm_destroy)(&pkvm_vm->kvm);
 
 	pkvm_guest_mmu_destroy(pkvm_vm);
+
+	/* Devices and guest mappings must be torn down before dropping backing. */
+	pkvm_destroy_hpa_backing(pkvm_vm);
+	release_pkvm_vm_handle(vm_handle);
 
 	teardown_donated_memory(mc, (void *)pkvm_vm, pkvm_vm->size);
 
@@ -2448,9 +2460,9 @@ struct pkvm_vm *pkvm_get_vm(int vm_handle)
 	return atomic_inc_not_zero(&pkvm_vm_ref->refcount) ? pkvm_vm_ref->pkvm_vm : NULL;
 }
 
-void pkvm_put_vm(struct pkvm_vm *pkvm_vm)
+void pkvm_put_vm_handle(int vm_handle)
 {
-	int idx = pkvm_vm->kvm.arch.pkvm.handle;
+	int idx = vm_handle;
 	struct pkvm_vm_ref *pkvm_vm_ref;
 
 	if (idx < 0 || idx >= MAX_PKVM_VMS)
@@ -2459,6 +2471,11 @@ void pkvm_put_vm(struct pkvm_vm *pkvm_vm)
 	pkvm_vm_ref = &pkvm_vms_ref[idx];
 
 	WARN_ON(atomic_dec_if_positive(&pkvm_vm_ref->refcount) <= 0);
+}
+
+void pkvm_put_vm(struct pkvm_vm *pkvm_vm)
+{
+	pkvm_put_vm_handle(pkvm_vm->kvm.arch.pkvm.handle);
 }
 
 struct pkvm_vcpu *pkvm_get_vcpu(int vm_handle, int vcpu_handle)
