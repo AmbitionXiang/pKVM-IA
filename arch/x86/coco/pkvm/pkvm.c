@@ -3,6 +3,8 @@
 #include <linux/kvm_para.h>
 #include <linux/io.h>
 #include <linux/pci.h>
+#include <linux/mutex.h>
+#include <linux/spinlock.h>
 #include <linux/uaccess.h>
 #include <asm/coco.h>
 #include <asm/pkvm_guest.h>
@@ -15,63 +17,25 @@
 DEFINE_STATIC_KEY_FALSE(pkvm_guest_detected);
 EXPORT_SYMBOL(pkvm_guest_detected);
 
-static struct pkvm_guest_mmio_info pkvm_mmio_info;
 static struct pkvm_guest_mmio_allow_range
 	pkvm_mmio_allow_ranges[PKVM_GUEST_MMIO_ALLOW_MAX_RANGES];
 static u16 pkvm_mmio_allow_nr_ranges;
-
-static struct pkvm_guest_ptdev_pci_id
-	pkvm_private_dma_list[PKVM_GUEST_PTDEV_MAX_DEVS] __ro_after_init;
-static unsigned int pkvm_private_dma_nr_entries __ro_after_init;
-
-static void __init pkvm_init_private_dma_list(void)
-{
-	unsigned int i;
-	long ret;
-
-	/* Touch the buffer so its pages are donated before the call. */
-	memset(pkvm_private_dma_list, 0, sizeof(pkvm_private_dma_list));
-	pkvm_private_dma_nr_entries = 0;
-
-	ret = kvm_hypercall2(PKVM_GHC_PTDEV_PCI_LIST, __pa(pkvm_private_dma_list),
-			     ARRAY_SIZE(pkvm_private_dma_list));
-	if (ret < 0 || ret > ARRAY_SIZE(pkvm_private_dma_list)) {
-		memset(pkvm_private_dma_list, 0, sizeof(pkvm_private_dma_list));
-		return;
-	}
-
-	pkvm_private_dma_nr_entries = ret;
-	for (i = 0; i < pkvm_private_dma_nr_entries; i++) {
-		struct pkvm_guest_ptdev_pci_id *id =
-			&pkvm_private_dma_list[i];
-
-		pr_info("pkvm: received ptdev vBDF=%04x:%02x:%02x.%x\n",
-			id->guest_segment, id->guest_bdf >> 8,
-			(id->guest_bdf >> 3) & 0x1f, id->guest_bdf & 0x7);
-	}
-}
+static DEFINE_RAW_SPINLOCK(pkvm_mmio_allow_lock);
 
 #if defined(CONFIG_PCI) && defined(CONFIG_SWIOTLB)
-static bool pkvm_private_dma_list_contains(int segment, u16 bdf)
+static bool pkvm_private_dma_allowed(int segment, u16 bdf)
 {
-	unsigned int i;
-
 	if (segment < 0 || segment > U16_MAX)
 		return false;
 
-	for (i = 0; i < pkvm_private_dma_nr_entries; i++) {
-		if (pkvm_private_dma_list[i].guest_segment == segment &&
-		    pkvm_private_dma_list[i].guest_bdf == bdf)
-			return true;
-	}
-	return false;
+	return kvm_hypercall2(PKVM_GHC_PTDEV_PDMA_ALLOWED, segment, bdf) == 1;
 }
 
 void arch_pci_set_private_dma_allowed(struct pci_dev *pdev)
 {
 	pdev->dev.private_dma_allowed = pkvm_is_protected_guest() &&
-		pkvm_private_dma_list_contains(pci_domain_nr(pdev->bus),
-					     PCI_DEVID(pdev->bus->number, pdev->devfn));
+		pkvm_private_dma_allowed(pci_domain_nr(pdev->bus),
+					 PCI_DEVID(pdev->bus->number, pdev->devfn));
 }
 #endif
 
@@ -112,11 +76,14 @@ int pkvm_set_mem_host_visibility(unsigned long addr, int numpages, bool enc)
 static bool pkvm_mmio_allow_hit(unsigned long gpa, int size)
 {
 	u64 access_end = (u64)gpa + size;
+	unsigned long flags;
+	bool hit = false;
 	u16 i;
 
 	if (access_end < gpa)
 		return false;
 
+	raw_spin_lock_irqsave(&pkvm_mmio_allow_lock, flags);
 	for (i = 0; i < pkvm_mmio_allow_nr_ranges; i++) {
 		struct pkvm_guest_mmio_allow_range *range =
 			&pkvm_mmio_allow_ranges[i];
@@ -128,11 +95,14 @@ static bool pkvm_mmio_allow_hit(unsigned long gpa, int size)
 		if (!(range->flags & PKVM_GUEST_MMIO_ALLOW_FLAG_DIRECT_BAR))
 			continue;
 
-		if (gpa >= range->guest_gpa && access_end <= range_end)
-			return true;
+		if (gpa >= range->guest_gpa && access_end <= range_end) {
+			hit = true;
+			break;
+		}
 	}
 
-	return false;
+	raw_spin_unlock_irqrestore(&pkvm_mmio_allow_lock, flags);
+	return hit;
 }
 
 static bool pkvm_direct_mmio_write(int size, unsigned long vaddr,
@@ -181,37 +151,62 @@ static bool pkvm_direct_mmio_read(int size, unsigned long vaddr,
 	}
 }
 
-static void pkvm_init_mmio_allowlist(void)
+#ifdef CONFIG_PCI
+static DEFINE_MUTEX(pkvm_mmio_refresh_lock);
+/* Static buffers provide GPAs for the hypercalls; serialize their use. */
+static struct pkvm_guest_mmio_info pkvm_mmio_refresh_info;
+static struct pkvm_guest_mmio_allow_range
+	pkvm_mmio_refresh_ranges[PKVM_GUEST_MMIO_ALLOW_MAX_RANGES];
+
+static int pkvm_refresh_mmio_allowlist(void)
 {
+	unsigned long flags;
 	long ret;
 
-	memset(&pkvm_mmio_info, 0, sizeof(pkvm_mmio_info));
-	memset(pkvm_mmio_allow_ranges, 0, sizeof(pkvm_mmio_allow_ranges));
-	pkvm_mmio_allow_nr_ranges = 0;
+	mutex_lock(&pkvm_mmio_refresh_lock);
+	memset(&pkvm_mmio_refresh_info, 0, sizeof(pkvm_mmio_refresh_info));
+	memset(pkvm_mmio_refresh_ranges, 0, sizeof(pkvm_mmio_refresh_ranges));
 
-	ret = kvm_hypercall2(PKVM_GHC_PTDEV_MMIO_INFO, __pa(&pkvm_mmio_info),
-			     sizeof(pkvm_mmio_info));
+	ret = kvm_hypercall2(PKVM_GHC_PTDEV_MMIO_INFO,
+			     __pa(&pkvm_mmio_refresh_info),
+			     sizeof(pkvm_mmio_refresh_info));
 	if (ret)
-		return;
+		goto out;
 
-	if (pkvm_mmio_info.nr_ranges > ARRAY_SIZE(pkvm_mmio_allow_ranges)) {
-		memset(&pkvm_mmio_info, 0, sizeof(pkvm_mmio_info));
-		return;
+	if (pkvm_mmio_refresh_info.nr_ranges >
+	    ARRAY_SIZE(pkvm_mmio_refresh_ranges)) {
+		ret = -E2BIG;
+		goto out;
 	}
 
-	pkvm_mmio_allow_nr_ranges = pkvm_mmio_info.nr_ranges;
-	if (!pkvm_mmio_allow_nr_ranges)
-		return;
-
-	ret = kvm_hypercall3(PKVM_GHC_PTDEV_MMIO_READ,
-			     __pa(pkvm_mmio_allow_ranges),
-			     pkvm_mmio_allow_nr_ranges, 0);
-	if (ret) {
-		memset(&pkvm_mmio_info, 0, sizeof(pkvm_mmio_info));
-		memset(pkvm_mmio_allow_ranges, 0, sizeof(pkvm_mmio_allow_ranges));
-		pkvm_mmio_allow_nr_ranges = 0;
+	if (pkvm_mmio_refresh_info.nr_ranges) {
+		ret = kvm_hypercall3(PKVM_GHC_PTDEV_MMIO_READ,
+				     __pa(pkvm_mmio_refresh_ranges),
+				     pkvm_mmio_refresh_info.nr_ranges, 0);
+		if (ret)
+			goto out;
 	}
+
+	/* Publish only a complete snapshot, including an empty allowlist. */
+	raw_spin_lock_irqsave(&pkvm_mmio_allow_lock, flags);
+	memcpy(pkvm_mmio_allow_ranges, pkvm_mmio_refresh_ranges,
+	       sizeof(pkvm_mmio_allow_ranges));
+	pkvm_mmio_allow_nr_ranges = pkvm_mmio_refresh_info.nr_ranges;
+	raw_spin_unlock_irqrestore(&pkvm_mmio_allow_lock, flags);
+out:
+	mutex_unlock(&pkvm_mmio_refresh_lock);
+	return ret > 0 ? -EIO : ret;
 }
+
+int arch_pci_refresh_mmio_allowlist(struct pci_dev *pdev)
+{
+	if (!pkvm_is_protected_guest())
+		return 0;
+
+	/* A new device may add ranges to the VM-wide MMIO allowlist. */
+	return pkvm_refresh_mmio_allowlist();
+}
+#endif
 
 static int pkvm_virt_mmio(int size, bool write, unsigned long vaddr, unsigned long *val)
 {
@@ -313,9 +308,6 @@ __init void pkvm_guest_init_coco(void)
 	cc_vendor = CC_VENDOR_PKVM;
 
 	static_branch_enable(&pkvm_guest_detected);
-
-	pkvm_init_mmio_allowlist();
-	pkvm_init_private_dma_list();
 
 	pv_ops.mmio.raw_readb = pkvm_mmio_readb;
 	pv_ops.mmio.raw_readw = pkvm_mmio_readw;

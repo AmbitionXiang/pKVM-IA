@@ -45,19 +45,14 @@
 #define PKVM_GHC_PTDEV_MMIO_INFO	PKVM_GHC_NUM(6)
 #define PKVM_GHC_PTDEV_MMIO_READ	PKVM_GHC_NUM(7)
 #define PKVM_GHC_GET_VE_GPA		PKVM_GHC_NUM(8)
-#define PKVM_GHC_PTDEV_PCI_LIST		PKVM_GHC_NUM(9)
-
-#define PKVM_GUEST_PTDEV_MAX_DEVS		16
+#define PKVM_GHC_PTDEV_PDMA_ALLOWED	PKVM_GHC_NUM(9)
 
 /*
- * PTDEV_PCI_LIST: a0 = array GPA, a1 = capacity in entries.
- * Returns the number of entries written, or a negative error.
- * Insufficient capacity returns -E2BIG without writing a partial list.
+ * PTDEV_PDMA_ALLOWED: a0 = guest PCI segment, a1 = guest BDF.
+ * Both arguments must fit in 16 bits. The calling vCPU identifies the VM.
+ * Returns 1 for a registered passthrough device assigned to the caller,
+ * 0 otherwise, or a negative error. No guest memory buffer is required.
  */
-struct pkvm_guest_ptdev_pci_id {
-	__u16 guest_segment;
-	__u16 guest_bdf;
-};
 
 #define PKVM_GUEST_MMIO_ALLOW_MAX_RANGES	16
 #define PKVM_GUEST_MMIO_ALLOW_FLAG_DIRECT_BAR	(1U << 0)

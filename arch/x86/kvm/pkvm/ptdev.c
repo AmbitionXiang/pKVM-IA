@@ -964,42 +964,31 @@ static int pkvm_write_guest_gpa(struct kvm_vcpu *vcpu, gpa_t gpa,
 	return ret;
 }
 
-int pkvm_handle_ptdev_pci_list(struct kvm_vcpu *vcpu, gpa_t guest_gpa,
-			       u64 max_entries)
+int pkvm_handle_ptdev_pdma_allowed(struct kvm_vcpu *vcpu, u64 guest_segment,
+				   u64 guest_bdf)
 {
-	struct pkvm_guest_ptdev_pci_id entries[PKVM_GUEST_PTDEV_MAX_DEVS];
 	struct pkvm_vm *vm = to_pkvm(vcpu->kvm);
 	struct pkvm_ptdev *ptdev;
-	unsigned int nr_entries = 0;
-	int ret = 0;
+	int allowed = 0;
 
-	pkvm_info("ptdev-pci-list: guest request vm=%d\n",
-		  vm->kvm.arch.pkvm.handle);
-
-	if (!guest_gpa || !max_entries || max_entries > ARRAY_SIZE(entries))
-		return -KVM_EINVAL;
-	if (guest_gpa > U64_MAX - max_entries * sizeof(entries[0]))
+	if (guest_segment > U16_MAX || guest_bdf > U16_MAX)
 		return -KVM_EINVAL;
 
+	/* Registration and detach update the guest identity under vm->lock. */
 	pkvm_spin_lock(&vm->lock);
 	list_for_each_entry(ptdev, &vm->ptdev_head, vm_node) {
-		if (!ptdev->guest_pci_id_valid)
+		if (!ptdev->guest_pci_id_valid ||
+		    ptdev->vm_handle != vm->kvm.arch.pkvm.handle)
 			continue;
-		if (nr_entries == max_entries) {
-			ret = -KVM_E2BIG;
+		if (ptdev->guest_segment == guest_segment &&
+		    ptdev->guest_bdf == guest_bdf) {
+			allowed = 1;
 			break;
 		}
-		entries[nr_entries].guest_segment = ptdev->guest_segment;
-		entries[nr_entries].guest_bdf = ptdev->guest_bdf;
-		nr_entries++;
 	}
 	pkvm_spin_unlock(&vm->lock);
-	if (ret)
-		return ret;
 
-	ret = pkvm_write_guest_gpa(vcpu, guest_gpa, entries,
-				   nr_entries * sizeof(entries[0]));
-	return ret ? -KVM_EFAULT : nr_entries;
+	return allowed;
 }
 
 int pkvm_handle_ptdev_mmio_info(struct kvm_vcpu *vcpu, gpa_t guest_gpa,
