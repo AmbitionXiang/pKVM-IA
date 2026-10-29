@@ -215,6 +215,18 @@ int pkvm_iommu_modify_irte(struct modify_irte_data *data);
 
 int pkvm_iommu_attach_ptdev(u16 bdf, int vm_handle);
 bool pkvm_iommu_vm_domains_ready(int vm_handle);
+bool pkvm_iommu_vm_dma_ready(int vm_handle, struct dmar_domain *mapping_domain);
+int pkvm_iommu_pause_dev_dma(struct dmar_domain *domain, int vm_handle);
+int pkvm_iommu_resume_dev_dma(u16 bdf, int vm_handle);
+void pkvm_iommu_add_pending(struct dmar_domain *domain,
+			    struct device_domain_info *info, u32 pasid);
+void pkvm_iommu_remove_pending(struct dmar_domain *domain,
+			       struct device_domain_info *info, u32 pasid);
+int pkvm_context_set_dma_enabled(struct dmar_domain *domain,
+				 struct device_domain_info *info, bool enabled);
+int pkvm_pasid_set_dma_enabled(struct dmar_domain *domain,
+			       struct device_domain_info *info, u32 pasid,
+			       bool enabled);
 
 /*
  * Return value from a pKVM MMIO register validator meaning "this offset is not

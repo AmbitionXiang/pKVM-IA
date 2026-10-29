@@ -1848,24 +1848,57 @@ unlock:
 	return ret;
 }
 
+#ifdef CONFIG_PKVM_INTEL
+/* Pause only; the caller has already checked the guest page state. */
+static int pause_dev_dma(unsigned long phys, unsigned long size,
+			 struct dmar_domain *domain, int vm_handle)
+{
+	int ret;
+
+	if (!domain)
+		return -EPERM;
+	/* Do not nest IOMMU locks under the host MMU lock. */
+	pkvm_host_mmu_unlock();
+	ret = pkvm_iommu_pause_dev_dma(domain, vm_handle);
+	pkvm_host_mmu_lock();
+	if (ret)
+		return ret;
+
+	/* The lock was dropped: confirm the private range is still valid. */
+	if (pkvm_lookup_hpa_vm(phys, phys + size) != vm_handle)
+		return -EPERM;
+	ret = check_host_mem_pgstate_mask(phys, size, BIT(PKVM_PAGE_NONE),
+					  PKVM_ID_GUEST, false);
+	if (ret)
+		return ret;
+	return pkvm_iommu_vm_dma_ready(vm_handle, domain) ? 0 : -EPERM;
+}
+#endif
+
 /**
- * pkvm_host_use_dma() - Pin host pages to be used for DMA.
- * @phys:	Physical address of the memory region to pin.
- * @size:	Size of the memory region to pin.
+ * pkvm_host_use_dma() - Validate a DMA range and pin its RAM pages.
+ * @phys: Physical start address of the DMA range.
+ * @size: Size of the DMA range in bytes.
+ * @domain: Mapping domain, or NULL for callers without a domain.
  *
- * Validates if the host is allowed to use the pages in range [@phys, @phys + @size)
- * for DMA, and if so, pins those pages, i.e. increments their refcounts in the
- * pkvm vmemmap, to indicate that the pages are used by the host for DMA. This will
- * disallow donating those pages, thus ensuring protection of pVM memory and
- * hypervisor memory from DMA from devices controlled by the host.
+ * Accept host-owned RAM in PKVM_PAGE_OWNED or PKVM_PAGE_SHARED_OWNED state,
+ * whether or not the range is registered to a VM. For a VM-registered range,
+ * also accept guest-owned RAM in PKVM_PAGE_NONE state when device assignment
+ * is complete, or the mapping domain's pending DMA entries are blocked.
  *
- * Both PKVM_PAGE_OWNED and PKVM_PAGE_SHARED_OWNED pages (host owner) are
- * accepted. SHARED_OWNED pages are already protected against guest donation by
- * their page state, but the refcount is incremented for symmetry.
+ * After validation, increment each RAM page's pKVM vmemmap refcount to track
+ * DMA use. This does not change page ownership or grant host CPU access.
+ * Donation checks account for DMA references and device assignment readiness;
+ * a nonzero DMA refcount does not unconditionally prevent donation to a VM.
  *
- * Returns: 0 on success, or a negative error code on failure.
+ * MMIO ranges must be PKVM_PAGE_OWNED in the host MMU and are not refcounted.
+ * Reject ranges mixing RAM and MMIO. DMA PTE installation is the caller's
+ * responsibility; this helper only validates and pins the target range.
+ *
+ * Return: 0 on success, or a negative error code on failure.
  */
-int pkvm_host_use_dma(unsigned long phys, unsigned long size)
+int pkvm_host_use_dma(unsigned long phys, unsigned long size,
+		      struct dmar_domain *domain)
 {
 	int vm_handle = -ENOENT;
 	int ret;
@@ -1898,30 +1931,25 @@ int pkvm_host_use_dma(unsigned long phys, unsigned long size)
 			/* Never interpret a mixed/invalid range as ordinary host DMA. */
 			ret = -EPERM;
 		} else {
-			/* HPA belongs to a VM.  Try HOST-owned first
-			 * (NoIommu, before donate). */
+			/* Registration alone does not imply donation to the guest. */
 			ret = check_host_mem_pgstate_mask(phys, size,
 							  BIT(PKVM_PAGE_OWNED) |
 							  BIT(PKVM_PAGE_SHARED_OWNED),
 							  PKVM_ID_HOST, false);
 			if (ret) {
-				/* Not HOST-owned; require GUEST-owned NONE
-				 * (viommu, after donate). */
+				/* Donated RAM must be guest-owned and unavailable to host. */
 				ret = check_host_mem_pgstate_mask(phys, size,
 								  BIT(PKVM_PAGE_NONE),
 								  PKVM_ID_GUEST, false);
 				if (ret == 0) {
 					/*
-					 * viommu final security check:
-					 * ensure all devices for this VM are
-					 * attached (pending_bdfs empty).
+					 * Pending devices must be attached or have
+					 * their DMA entries blocked before pinning.
 					 */
 #ifdef CONFIG_PKVM_INTEL
-					if (!pkvm_iommu_vm_domains_ready(vm_handle)) {
-						kvm_err("pkvm: use_dma: devices not attached for VM %d\n",
-							vm_handle);
-						ret = -EPERM;
-					}
+					if (!pkvm_iommu_vm_dma_ready(vm_handle, domain))
+						ret = pause_dev_dma(phys, size,
+								    domain, vm_handle);
 #else
 					ret = -EPERM;
 #endif
@@ -1938,9 +1966,7 @@ int pkvm_host_use_dma(unsigned long phys, unsigned long size)
 		 * Host may need to DMA-map reserved memory (e.g. RMRRs on Intel)
 		 * which is treated as MMIO by pKVM. Allow it, as long as the host is
 		 * allowed to access this memory. Cannot pin it, since MMIO pages are
-		 * not tracked in pkvm's vmemmap and thus have no refcount. This is ok
-		 * as long as pKVM doesn't support device assignment, so it never
-		 * donates MMIO pages at runtime.
+		 * not tracked in pkvm's vmemmap and thus have no refcount.
 		 *
 		 * FIXME: this assumes that any such reserved memory regions are
 		 * in holes between memory memblocks (so they have been already
@@ -1971,15 +1997,13 @@ unlock:
 }
 
 /**
- * pkvm_host_unuse_dma() - Unpin host pages that were previously pinned for DMA.
- * @phys:	Physical address of the memory region to unpin.
- * @size:	Size of the memory region to unpin.
+ * pkvm_host_unuse_dma() - Release RAM references acquired for DMA use.
+ * @phys: Physical start address of the DMA range.
+ * @size: Size of the DMA range in bytes.
  *
- * Unpins the pages in range [@phys, @phys + @size) that were previously pinned
- * via pkvm_host_use_dma(). Once pkvm_host_unuse_dma() is called for the given
- * page as many times as pkvm_host_use_dma() was called for it, its refcount
- * drops back to zero, indicating that the page is not used for the host DMA
- * anymore and thus is allowed to be donated.
+ * Drop one pKVM vmemmap reference per RAM page to balance a successful
+ * pkvm_host_use_dma() call. Do not change page ownership or remove DMA PTEs.
+ * MMIO ranges have no references to release.
  */
 void pkvm_host_unuse_dma(unsigned long phys, unsigned long size)
 {

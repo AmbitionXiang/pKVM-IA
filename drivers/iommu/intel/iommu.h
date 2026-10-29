@@ -660,6 +660,15 @@ struct qi_batch {
 #define PKVM_DOMAIN_HOST (-2)
 /* domain.vm_handle >= 0 indicates this domain is bound to a pVM */
 
+#ifdef __PKVM_HYP__
+struct pkvm_pending_ptdev {
+	struct intel_iommu *iommu;
+	u32 pasid;
+	u16 bdf;
+	u8 ats_qdep;
+};
+#endif
+
 struct dmar_domain {
 #ifndef __PKVM_HYP__
 	int	nid;			/* node id */
@@ -771,7 +780,8 @@ struct dmar_domain {
 	int vm_handle;
 	/* PKVM: BDFs of devices that have pasid_setup_sl but not yet attach_ptdev */
 #define MAX_PENDING_BDFS	8
-	u16 pending_bdfs[MAX_PENDING_BDFS];
+	struct pkvm_pending_ptdev pending_devs[MAX_PENDING_BDFS];
+	bool pending_dma_blocked;
 	u8 pending_count;
 #endif /* !__PKVM_HYP__ */
 };
@@ -1235,6 +1245,19 @@ static inline void context_clear_present(struct context_entry *context)
 	WRITE_ONCE(context->lo, val);
 	dma_wmb();
 }
+
+#ifdef __PKVM_HYP__
+/*
+ * With iommu->lock held, a non-present entry retaining configuration is
+ * paused. Setup publishes Present before unlocking; teardown clears both
+ * words before unlocking. Only DMA pause leaves this intermediate state.
+ */
+static inline bool context_dma_paused(struct context_entry *context)
+{
+	return !(READ_ONCE(context->lo) & 1) &&
+		(READ_ONCE(context->lo) || READ_ONCE(context->hi));
+}
+#endif
 
 static inline void context_set_fault_enable(struct context_entry *context)
 {

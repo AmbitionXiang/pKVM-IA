@@ -627,6 +627,8 @@ int pkvm_attach_ptdev(u16 bdf, struct pkvm_vm *vm)
 
 	pkvm_spin_lock(&ptdev->lock);
 	ret = pkvm_publish_ptdev_mmio_contract_locked(vm, ptdev);
+	if (!ret)
+		ret = pkvm_iommu_resume_dev_dma(bdf, vm_handle);
 	pkvm_spin_unlock(&ptdev->lock);
 	if (ret) {
 		pkvm_detach_ptdev(ptdev, vm);

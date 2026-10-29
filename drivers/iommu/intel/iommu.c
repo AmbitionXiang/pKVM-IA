@@ -1688,6 +1688,12 @@ int domain_context_mapping_one(struct dmar_domain *domain,
 	spin_lock(&iommu->lock);
 	ret = -ENOMEM;
 	context = iommu_context_addr(iommu, bus, devfn, 1);
+#ifdef __PKVM_HYP__
+	if (context && context_dma_paused(context)) {
+		ret = -EBUSY;
+		goto out_unlock;
+	}
+#endif
 	if (!context)
 		goto out_unlock;
 
@@ -1731,6 +1737,49 @@ out_unlock:
 
 	return ret;
 }
+
+#ifdef __PKVM_HYP__
+int pkvm_context_set_dma_enabled(struct dmar_domain *domain,
+				 struct device_domain_info *info, bool enabled)
+{
+	struct intel_iommu *iommu = info->iommu;
+	struct context_entry *context;
+	bool paused;
+	u16 did;
+	int ret = 0;
+
+	spin_lock(&iommu->lock);
+	context = iommu_context_addr(iommu, info->bus, info->devfn, 0);
+	if (!context) {
+		ret = -ENODEV;
+		goto out;
+	}
+	paused = context_dma_paused(context);
+	if ((!context_present(context) && !paused) ||
+	    (context->lo & VTD_PAGE_MASK) != __pkvm_pa(domain->pgd)) {
+		ret = -EPERM;
+		goto out;
+	}
+	if (enabled && !paused)
+		goto out;
+	pkvm_populate_dev_info_from_ce(info, context);
+	did = context_domain_id(context);
+	if (enabled) {
+		context_set_present(context);
+	} else {
+		if (paused)
+			goto out;
+		context_clear_present(context);
+	}
+	__iommu_flush_cache(iommu, context, sizeof(*context));
+	intel_context_flush_no_pasid(info, context, did);
+	if (enabled)
+		context_present_cache_flush(iommu, did, info->bus, info->devfn);
+out:
+	spin_unlock(&iommu->lock);
+	return ret;
+}
+#endif
 
 #ifndef __PKVM_HYP__
 static int domain_context_mapping_cb(struct pci_dev *pdev,
@@ -1856,7 +1905,8 @@ int domain_map(struct dmar_domain *domain, unsigned long iov_pfn,
 #endif
 
 #ifdef __PKVM_HYP__
-	ret = pkvm_host_use_dma(phys_pfn << VTD_PAGE_SHIFT, nr_pages * VTD_PAGE_SIZE);
+	ret = pkvm_host_use_dma(phys_pfn << VTD_PAGE_SHIFT,
+				nr_pages * VTD_PAGE_SIZE, domain);
 	if (ret)
 		return ret;
 #endif
@@ -1981,7 +2031,7 @@ out:
 }
 
 #ifdef __PKVM_HYP__
-static bool pasid_table_has_present_entries(struct pasid_dir_entry *dir, int max_pde)
+static bool pasid_table_has_configured_entries(struct pasid_dir_entry *dir, int max_pde)
 {
 	int i;
 
@@ -1993,7 +2043,7 @@ static bool pasid_table_has_present_entries(struct pasid_dir_entry *dir, int max
 			continue;
 
 		for (j = 0; j < PASID_TBL_ENTRIES; j++) {
-			if (pasid_pte_is_present(&table[j])) {
+			if (pasid_entry_configured(&table[j])) {
 				u32 pasid = (i << PASID_PDE_SHIFT) + j;
 
 				pr_warn("pkvm: found active entry for pasid:%x\n",
@@ -2057,12 +2107,12 @@ void domain_context_clear_one(struct device_domain_info *info, u8 bus, u8 devfn,
 	}
 
 #ifdef __PKVM_HYP__
-	if (context_present(context)) {
+	if (context_present(context) || context_dma_paused(context)) {
 		pkvm_populate_dev_info_from_ce(info, context);
 		if (sm) {
 			pasid_dir = __pkvm_va(context->lo & VTD_PAGE_MASK);
 			pasid_dir_sz = get_pasid_dir_size(context);
-			if (WARN_ON(pasid_table_has_present_entries(pasid_dir, pasid_dir_sz))) {
+			if (pasid_table_has_configured_entries(pasid_dir, pasid_dir_sz)) {
 				spin_unlock(&iommu->lock);
 				return;
 			}

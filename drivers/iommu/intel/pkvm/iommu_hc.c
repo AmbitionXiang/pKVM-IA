@@ -54,23 +54,9 @@ int pkvm_iommu_clear_ce(struct clear_ce_data *data)
 		 __func__, data->bus, data->devfn, data->ats_qdep);
 	domain_context_clear_one(&info, data->bus, data->devfn, &domain);
 	if (domain) {
-		if (domain != &pt_domain) {
-			u16 bdf = PCI_DEVID(data->bus, data->devfn);
-			int i;
-
-			pkvm_spin_lock(&domain->lock);
-			/* The cleared context no longer binds this BDF to the domain. */
-			for (i = 0; i < domain->pending_count; i++) {
-				if (domain->pending_bdfs[i] != bdf)
-					continue;
-				domain->pending_count--;
-				domain->pending_bdfs[i] =
-					domain->pending_bdfs[domain->pending_count];
-				domain->pending_bdfs[domain->pending_count] = 0;
-				break;
-			}
-			pkvm_spin_unlock(&domain->lock);
-		}
+		pkvm_spin_lock(&domain->lock);
+		pkvm_iommu_remove_pending(domain, &info, IOMMU_NO_PASID);
+		pkvm_spin_unlock(&domain->lock);
 		pkvm_put_iommu_domain(domain);
 	}
 
@@ -152,26 +138,16 @@ static int iommu_set_lm_ce(struct set_lm_ce_data *data)
 		 data->bus, data->devfn, data->did, domain->pgd,
 		 domain->agaw);
 
-	ret = domain_context_mapping_one(domain, iommu, &info, data->did,
-					 data->bus, data->devfn);
-
-	if (!ret && domain != &pt_domain) {
-		int i;
-
-		pkvm_spin_lock(&domain->lock);
-		for (i = 0; i < domain->pending_count; i++) {
-			if (domain->pending_bdfs[i] == bdf)
-				break;
-		}
-		if (i == domain->pending_count) {
-			if (domain->pending_count < MAX_PENDING_BDFS)
-				domain->pending_bdfs[domain->pending_count++] = bdf;
-			else
-				pkvm_err("%s: pending BDFs full, bdf=0x%x\n",
-						__func__, bdf);
-		}
-		pkvm_spin_unlock(&domain->lock);
+	pkvm_spin_lock(&domain->lock);
+	if (domain->pending_dma_blocked || domain->pending_count == MAX_PENDING_BDFS) {
+		ret = -EBUSY;
+	} else {
+		ret = domain_context_mapping_one(domain, iommu, &info, data->did,
+						 data->bus, data->devfn);
+		if (!ret)
+			pkvm_iommu_add_pending(domain, &info, IOMMU_NO_PASID);
 	}
+	pkvm_spin_unlock(&domain->lock);
 
 	if (ret) {
 		pkvm_put_iommu_domain(domain);
@@ -350,9 +326,17 @@ static int iommu_pasid_setup_fl(struct pasid_setup_fl_data *data)
 		flags |= PASID_FLAG_PAGE_SNOOP;
 	if (level == 5)
 		flags |= PASID_FLAG_FL5LP;
-	ret = intel_pasid_setup_first_level(iommu, domain, &dev,
-					    __pkvm_pa(pgd),
-					    data->pasid, data->did, flags);
+	pkvm_spin_lock(&domain->lock);
+	if (domain->pending_dma_blocked || domain->pending_count == MAX_PENDING_BDFS) {
+		ret = -EBUSY;
+	} else {
+		ret = intel_pasid_setup_first_level(iommu, domain, &dev,
+						    __pkvm_pa(pgd), data->pasid,
+						    data->did, flags);
+		if (!ret)
+			pkvm_iommu_add_pending(domain, &info, data->pasid);
+	}
+	pkvm_spin_unlock(&domain->lock);
 
 put_domain:
 	if (ret)
@@ -415,28 +399,20 @@ static int iommu_pasid_setup_sl(struct pasid_setup_sl_data *data)
 	pkvm_dbg("%s: dev[%x:%x], pasid: %x ssptptr_gpa: %llx, did: %d\n", __func__,
 		 data->bus, data->devfn, data->pasid, data->ssptptr_gpa, data->did);
 
-	ret = intel_pasid_setup_second_level(iommu, domain, &dev,
-					     data->did, data->pasid);
-	if (ret) {
-		pkvm_put_iommu_domain(domain);
-		return ret;
-	}
-
 	pkvm_spin_lock(&domain->lock);
-	if (domain->pending_count < MAX_PENDING_BDFS) {
-		u16 bdf = PCI_DEVID(data->bus, data->devfn);
-		int i;
-		for (i = 0; i < domain->pending_count; i++) {
-			if (domain->pending_bdfs[i] == bdf)
-				break;
-		}
-		if (i == domain->pending_count)
-			domain->pending_bdfs[domain->pending_count++] = bdf;
+	if (domain->pending_dma_blocked || domain->pending_count == MAX_PENDING_BDFS) {
+		ret = -EBUSY;
+	} else {
+		ret = intel_pasid_setup_second_level(iommu, domain, &dev,
+						     data->did, data->pasid);
+		if (!ret)
+			pkvm_iommu_add_pending(domain, &info, data->pasid);
 	}
 	pkvm_spin_unlock(&domain->lock);
-
-	pkvm_put_iommu_domain(domain);
-	return 0;
+	if (ret)
+		pkvm_put_iommu_domain(domain);
+	/* As in legacy setup, the installed entry retains the domain reference. */
+	return ret;
 }
 
 int pkvm_iommu_pasid_setup_sl(struct pasid_setup_sl_data *in, struct pasid_setup_sl_data *out)
@@ -474,8 +450,12 @@ int pkvm_iommu_pasid_teardown(struct pasid_teardown_data *data)
 	pkvm_dbg("%s: dev[%x:%x], pasid: %x, ats_qdep: %d\n", __func__,
 		 data->bus, data->devfn, data->pasid, data->ats_qdep);
 	intel_pasid_tear_down_entry(iommu, &dev, data->pasid, false, &domain);
-	if (domain)
+	if (domain) {
+		pkvm_spin_lock(&domain->lock);
+		pkvm_iommu_remove_pending(domain, &info, data->pasid);
+		pkvm_spin_unlock(&domain->lock);
 		pkvm_put_iommu_domain(domain);
+	}
 
 	return 0;
 }
@@ -601,7 +581,7 @@ int pkvm_iommu_modify_irte(struct modify_irte_data *data)
 	if (modified.pst == 1) {
 		unsigned long pda_pa = ((u64)modified.pda_h << 32) | ((u64)modified.pda_l << 6);
 
-		ret = pkvm_host_use_dma(PAGE_ALIGN_DOWN(pda_pa), PAGE_SIZE);
+		ret = pkvm_host_use_dma(PAGE_ALIGN_DOWN(pda_pa), PAGE_SIZE, NULL);
 		if (ret) {
 			pkvm_err("iommu%d: modify_irte: index[%u] pinning PDA[%lx] failed(err=%d)\n",
 				 iommu->seq_id, data->index, pda_pa, ret);
