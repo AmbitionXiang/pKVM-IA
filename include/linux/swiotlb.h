@@ -17,6 +17,7 @@ struct scatterlist;
 #define SWIOTLB_VERBOSE	(1 << 0) /* verbose initialization */
 #define SWIOTLB_FORCE	(1 << 1) /* force bounce buffering */
 #define SWIOTLB_ANY	(1 << 2) /* allow any memory for the buffer */
+#define SWIOTLB_FORCE_PARTIAL (1 << 3) /* force bounce unless private DMA is allowed */
 
 /*
  * Maximum allowable number of contiguous slabs to map,
@@ -91,6 +92,7 @@ struct io_tlb_pool {
  * @nslabs:	Total number of IO TLB slabs in all pools.
  * @debugfs:	The dentry to debugfs.
  * @force_bounce: %true if swiotlb bouncing is forced
+ * @force_bounce_partial: %true if devices without private DMA require bouncing
  * @for_alloc:  %true if the pool is used for memory allocation
  * @can_grow:	%true if more pools can be allocated dynamically.
  * @phys_limit:	Maximum allowed physical address.
@@ -110,6 +112,7 @@ struct io_tlb_mem {
 	unsigned long nslabs;
 	struct dentry *debugfs;
 	bool force_bounce;
+	bool force_bounce_partial;
 	bool for_alloc;
 #ifdef CONFIG_SWIOTLB_DYNAMIC
 	bool can_grow;
@@ -173,7 +176,8 @@ static inline bool is_swiotlb_force_bounce(struct device *dev)
 {
 	struct io_tlb_mem *mem = dev->dma_io_tlb_mem;
 
-	return mem && mem->force_bounce;
+	return mem && (mem->force_bounce ||
+		       (mem->force_bounce_partial && !dev->private_dma_allowed));
 }
 
 void swiotlb_init(bool addressing_limited, unsigned int flags);
