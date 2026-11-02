@@ -36,6 +36,16 @@ static void pci_pwrctrl_unregister(struct device *dev)
 	of_node_clear_flag(np, OF_POPULATED);
 }
 
+/**
+ * arch_pci_remove_mmio_allowlist - Remove a device's cached MMIO permissions
+ * @pdev: PCI device being removed
+ *
+ * Called after driver cleanup, while BAR resources still exist.
+ */
+void __weak arch_pci_remove_mmio_allowlist(struct pci_dev *pdev)
+{
+}
+
 static void pci_stop_dev(struct pci_dev *dev)
 {
 	pci_pme_active(dev, false);
@@ -44,6 +54,7 @@ static void pci_stop_dev(struct pci_dev *dev)
 		return;
 
 	device_release_driver(&dev->dev);
+	arch_pci_remove_mmio_allowlist(dev);
 	pci_proc_detach_device(dev);
 	pci_remove_sysfs_dev_files(dev);
 	of_pci_remove_node(dev);

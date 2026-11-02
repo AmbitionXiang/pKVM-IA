@@ -519,8 +519,10 @@ int kvm_arch_add_device_to_pkvm(struct kvm *kvm, struct file *file)
 static int remove_device_from_pkvm(struct device *dev, void *data)
 {
 	struct kvm *kvm = data;
+	struct kvm_pkvm_vm *pkvm = &kvm->arch.pkvm;
 	struct pci_dev *pdev;
 	u16 devid;
+	int ret;
 
 	if (!dev_is_pci(dev))
 		return 0;
@@ -528,7 +530,19 @@ static int remove_device_from_pkvm(struct device *dev, void *data)
 	pdev = to_pci_dev(dev);
 	devid = PCI_DEVID(pdev->bus->number, pdev->devfn);
 
-	return pkvm_hypercall(remove_ptdev, kvm->arch.pkvm.handle, devid);
+	/* Serialize detach and cache removal with metadata submission. */
+	mutex_lock(&pkvm->finalized_lock);
+	ret = pkvm_hypercall(remove_ptdev, pkvm->handle, devid);
+	if (!ret && pkvm->ptdev_mmio_metadata_valid &&
+	    pkvm->ptdev_mmio_metadata.segment == pci_domain_nr(pdev->bus) &&
+	    pkvm->ptdev_mmio_metadata.bdf == devid) {
+		memset(&pkvm->ptdev_mmio_metadata, 0,
+		       sizeof(pkvm->ptdev_mmio_metadata));
+		pkvm->ptdev_mmio_metadata_valid = false;
+	}
+	mutex_unlock(&pkvm->finalized_lock);
+
+	return ret;
 }
 
 int kvm_arch_remove_device_from_pkvm(struct kvm *kvm, struct file *file)

@@ -206,6 +206,46 @@ int arch_pci_refresh_mmio_allowlist(struct pci_dev *pdev)
 	/* A new device may add ranges to the VM-wide MMIO allowlist. */
 	return pkvm_refresh_mmio_allowlist();
 }
+
+void arch_pci_remove_mmio_allowlist(struct pci_dev *pdev)
+{
+	unsigned long flags;
+	int bar;
+
+	if (!pkvm_is_protected_guest())
+		return;
+
+	/* Serialize local removal with publication of a refreshed snapshot. */
+	mutex_lock(&pkvm_mmio_refresh_lock);
+	raw_spin_lock_irqsave(&pkvm_mmio_allow_lock, flags);
+	for (bar = 0; bar < PCI_STD_NUM_BARS; bar++) {
+		struct resource *res = &pdev->resource[bar];
+		u16 i = 0;
+
+		if (!(res->flags & IORESOURCE_MEM) ||
+		    (res->flags & IORESOURCE_UNSET) || !resource_size(res))
+			continue;
+
+		while (i < pkvm_mmio_allow_nr_ranges) {
+			struct pkvm_guest_mmio_allow_range *range =
+				&pkvm_mmio_allow_ranges[i];
+
+			if (!range->size || range->guest_gpa > res->end ||
+			    (range->guest_gpa < res->start &&
+			     range->size <= res->start - range->guest_gpa)) {
+				i++;
+				continue;
+			}
+
+			/* Each published range is a subrange of one device BAR. */
+			*range = pkvm_mmio_allow_ranges[--pkvm_mmio_allow_nr_ranges];
+			memset(&pkvm_mmio_allow_ranges[pkvm_mmio_allow_nr_ranges],
+			       0, sizeof(*range));
+		}
+	}
+	raw_spin_unlock_irqrestore(&pkvm_mmio_allow_lock, flags);
+	mutex_unlock(&pkvm_mmio_refresh_lock);
+}
 #endif
 
 static int pkvm_virt_mmio(int size, bool write, unsigned long vaddr, unsigned long *val)
