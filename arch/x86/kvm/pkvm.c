@@ -415,12 +415,8 @@ static int pkvm_vm_ioctl_set_ptdev_mmio_metadata(
 	if (ret)
 		return ret;
 
+	/* Also serializes metadata submission with successful device removal. */
 	mutex_lock(&pkvm->finalized_lock);
-	if (pkvm->finalized) {
-		ret = -EBUSY;
-		goto out;
-	}
-
 	if (pkvm->ptdev_mmio_metadata_valid) {
 		ret = pkvm_ptdev_mmio_metadata_equal(&pkvm->ptdev_mmio_metadata,
 						     &kmeta) ?
@@ -461,11 +457,9 @@ static int pkvm_vm_ioctl_set_ptdev_pci_id(
 	guest_id = ((u32)id.guest_segment << 16) | id.guest_bdf;
 
 	mutex_lock(&pkvm->finalized_lock);
-	if (pkvm->finalized)
-		ret = -EBUSY;
-	else
-		ret = pkvm_hypercall(register_ptdev_pci_id, pkvm->handle,
-				    host_id, guest_id);
+	/* pKVM gates first-time configuration on completed device attachment. */
+	ret = pkvm_hypercall(register_ptdev_pci_id, pkvm->handle,
+			     host_id, guest_id);
 	mutex_unlock(&pkvm->finalized_lock);
 
 	return ret;

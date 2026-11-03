@@ -55,6 +55,8 @@ struct pkvm_ptdev {
 	u16 guest_segment;
 	u16 guest_bdf;
 	bool guest_pci_id_valid;
+	/* Protected by lock; permits configuration only after add_ptdev succeeds. */
+	bool attach_complete;
 	unsigned long index;
 
 	pkvm_spinlock_t lock;

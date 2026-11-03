@@ -43,6 +43,7 @@ static struct pkvm_ptdev *__pkvm_alloc_ptdev_locked(u16 bdf)
 		ptdev->guest_segment = 0;
 		ptdev->guest_bdf = 0;
 		ptdev->guest_pci_id_valid = false;
+		ptdev->attach_complete = false;
 		ptdev->index = index;
 		ptdev->owner = PKVM_PTDEV_OWNER_HOST;
 		ptdev->assignment_state = PKVM_PTDEV_DETACHED;
@@ -422,6 +423,7 @@ int pkvm_detach_ptdev(struct pkvm_ptdev *ptdev, struct pkvm_vm *vm)
 
 	/* Reset what the attach API has set */
 	pkvm_spin_lock(&ptdev->lock);
+	ptdev->attach_complete = false;
 	ret = pkvm_restore_ptdev_bars_locked(vm, ptdev);
 	if (ret) {
 		pkvm_err("pkvm: detach ptdev restore failed bdf=0x%x ret=%d\n",
@@ -629,6 +631,8 @@ int pkvm_attach_ptdev(u16 bdf, struct pkvm_vm *vm)
 	ret = pkvm_publish_ptdev_mmio_contract_locked(vm, ptdev);
 	if (!ret)
 		ret = pkvm_iommu_resume_dev_dma(bdf, vm_handle);
+	if (!ret)
+		ptdev->attach_complete = true;
 	pkvm_spin_unlock(&ptdev->lock);
 	if (ret) {
 		pkvm_detach_ptdev(ptdev, vm);
@@ -680,12 +684,12 @@ int pkvm_register_ptdev_pci_id(struct pkvm_vm *vm, u64 host_id, u64 guest_id)
 	/* Keep the existing ptdev -> VM lock order used by BAR publication. */
 	pkvm_spin_lock(&ptdev->lock);
 	pkvm_spin_lock(&vm->lock);
-	if (vm->kvm.arch.pkvm.finalized) {
-		ret = -EBUSY;
-		goto out;
-	}
 	if (ptdev->vm_handle != vm->kvm.arch.pkvm.handle) {
 		ret = -EPERM;
+		goto out;
+	}
+	if (!ptdev->attach_complete) {
+		ret = -EAGAIN;
 		goto out;
 	}
 	if (ptdev->assignment_state != PKVM_PTDEV_GUEST_ASSIGNED ||
@@ -699,7 +703,7 @@ int pkvm_register_ptdev_pci_id(struct pkvm_vm *vm, u64 host_id, u64 guest_id)
 		goto out;
 	}
 
-	/* vm->lock serializes duplicate checks, publication and finalize. */
+	/* vm->lock serializes duplicate guest PCI identity checks. */
 	list_for_each_entry(other, &vm->ptdev_head, vm_node) {
 		if (other != ptdev && other->guest_pci_id_valid &&
 		    other->guest_segment == guest_segment &&
@@ -863,6 +867,12 @@ int pkvm_set_ptdev_mmio_metadata(struct pkvm_vm *vm,
 	pkvm_spin_lock(&ptdev->lock);
 	if (ptdev->vm_handle != vm_handle) {
 		ret = -ENODEV;
+		goto out;
+	}
+
+	/* Allow one immutable metadata snapshot per completed attachment. */
+	if (!ptdev->attach_complete) {
+		ret = -EAGAIN;
 		goto out;
 	}
 
