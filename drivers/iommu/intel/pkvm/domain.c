@@ -14,7 +14,8 @@
 /*
  * TODO: Make this a dynamic value.
  */
-#define MAX_IOMMU_DOMAIN_NUM	128
+/* Temporary capacity increase for large-platform boot validation. */
+#define MAX_IOMMU_DOMAIN_NUM	512
 static DEFINE_HASHTABLE(iommu_domain_hasht, 8);
 static DECLARE_BITMAP(iommu_domains_bitmap, MAX_IOMMU_DOMAIN_NUM);
 static struct dmar_domain iommu_domains[MAX_IOMMU_DOMAIN_NUM];
