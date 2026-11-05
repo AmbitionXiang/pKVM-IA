@@ -1848,8 +1848,30 @@ unlock:
 	return ret;
 }
 
+/* Validate a VM-registered RAM range, allowing mixed page ownership. */
+static int check_vm_dma_pages(unsigned long phys, unsigned long size)
+{
+	int ret;
+
+	for_each_pkvm_page(page, phys, size) {
+		u64 states = BIT(PKVM_PAGE_OWNED) | BIT(PKVM_PAGE_SHARED_OWNED);
+		enum pkvm_owner_id owner = PKVM_ID_HOST;
+
+		if (page->host_state == PKVM_PAGE_NONE ||
+		    page->host_state == PKVM_PAGE_SHARED_BORROWED) {
+			states = BIT(PKVM_PAGE_NONE) | BIT(PKVM_PAGE_SHARED_BORROWED);
+			owner = PKVM_ID_GUEST;
+		}
+		ret = check_host_mem_pgstate_mask(pkvm_page_to_phys(page), PAGE_SIZE,
+						  states, owner, false);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
 #ifdef CONFIG_PKVM_INTEL
-/* Pause only; the caller has already checked the guest page state. */
+/* Pause only; the caller has already checked the RAM page states. */
 static int pause_dev_dma(unsigned long phys, unsigned long size,
 			 struct dmar_domain *domain, int vm_handle)
 {
@@ -1864,11 +1886,10 @@ static int pause_dev_dma(unsigned long phys, unsigned long size,
 	if (ret)
 		return ret;
 
-	/* The lock was dropped: confirm the private range is still valid. */
+	/* The lock was dropped: revalidate the complete mixed RAM range. */
 	if (pkvm_lookup_hpa_vm(phys, phys + size) != vm_handle)
 		return -EPERM;
-	ret = check_host_mem_pgstate_mask(phys, size, BIT(PKVM_PAGE_NONE),
-					  PKVM_ID_GUEST, false);
+	ret = check_vm_dma_pages(phys, size);
 	if (ret)
 		return ret;
 	return pkvm_iommu_vm_dma_ready(vm_handle, domain) ? 0 : -EPERM;
@@ -1883,8 +1904,9 @@ static int pause_dev_dma(unsigned long phys, unsigned long size,
  *
  * Accept host-owned RAM in PKVM_PAGE_OWNED or PKVM_PAGE_SHARED_OWNED state,
  * whether or not the range is registered to a VM. For a VM-registered range,
- * also accept guest-owned RAM in PKVM_PAGE_NONE state when device assignment
- * is complete, or the mapping domain's pending DMA entries are blocked.
+ * also accept a mixture of host-owned, guest-private and guest-shared pages
+ * when device assignment is complete, or the mapping domain's pending DMA
+ * entries are blocked. Guest-shared pages may become private on unshare.
  *
  * After validation, increment each RAM page's pKVM vmemmap refcount to track
  * DMA use. This does not change page ownership or grant host CPU access.
@@ -1937,10 +1959,8 @@ int pkvm_host_use_dma(unsigned long phys, unsigned long size,
 							  BIT(PKVM_PAGE_SHARED_OWNED),
 							  PKVM_ID_HOST, false);
 			if (ret) {
-				/* Donated RAM must be guest-owned and unavailable to host. */
-				ret = check_host_mem_pgstate_mask(phys, size,
-								  BIT(PKVM_PAGE_NONE),
-								  PKVM_ID_GUEST, false);
+				/* The range may mix host, guest-private and guest-shared RAM. */
+				ret = check_vm_dma_pages(phys, size);
 				if (ret == 0) {
 					/*
 					 * Pending devices must be attached or have
