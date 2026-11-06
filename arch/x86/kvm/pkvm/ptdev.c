@@ -630,8 +630,6 @@ int pkvm_attach_ptdev(u16 bdf, struct pkvm_vm *vm)
 	pkvm_spin_lock(&ptdev->lock);
 	ret = pkvm_publish_ptdev_mmio_contract_locked(vm, ptdev);
 	if (!ret)
-		ret = pkvm_iommu_resume_dev_dma(bdf, vm_handle);
-	if (!ret)
 		ptdev->attach_complete = true;
 	pkvm_spin_unlock(&ptdev->lock);
 	if (ret) {
@@ -823,6 +821,11 @@ static int pkvm_publish_ptdev_mmio_contract_locked(struct pkvm_vm *vm,
 
 	if (!pkvm_ptdev_allows_guest_bar_mapping_locked(ptdev))
 		return -EAGAIN;
+
+	ret = pkvm_iommu_resume_dev_dma(ptdev->bdf,
+					vm->kvm.arch.pkvm.handle);
+	if (ret)
+		return ret;
 
 	pkvm_update_vm_mmio_allowlist(vm, &ptdev->mmio_metadata);
 	for (idx = 0; idx < ptdev->touched_mmio_range_count; idx++) {
