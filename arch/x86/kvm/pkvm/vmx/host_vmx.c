@@ -383,7 +383,7 @@ static void handle_pending_events(struct kvm_vcpu *vcpu, bool *req_immediate_exi
 
 static void fixup_host_vmx(struct vcpu_vmx *vmx)
 {
-	if (boot_cpu_has(X86_FEATURE_INTEL_PT)) {
+	if (host_vmcs_config.vmentry_ctrl & VM_ENTRY_LOAD_IA32_RTIT_CTL) {
 		/*
 		 * The VM_ENTRY_LOAD_IA32_RTIT_CTL bit may be cleared due to the
 		 * MSR_IA32_RTIT_CTL TRACEEN bit is set before deprivileging. See

@@ -406,10 +406,10 @@ int pkvm_host_ept_finalize(struct pkvm_pgtable *pgt)
 	kvm_clear_request(KVM_REQ_TLB_FLUSH_CURRENT, hvcpu);
 
 	/*
-	 * Re-enable the SECONDARY_EXEC_PT_USE_GPA bit if support Intel PT
-	 * which was disabled together with the EPT before deprivileging.
+	 * Restore PT_USE_GPA only if selected in the host VMCS configuration.
+	 * It was disabled together with EPT before deprivileging.
 	 */
-	if (boot_cpu_has(X86_FEATURE_INTEL_PT))
+	if (host_vmcs_config.cpu_based_2nd_exec_ctrl & SECONDARY_EXEC_PT_USE_GPA)
 		secondary_exec_controls_setbit(to_vmx(hvcpu), SECONDARY_EXEC_PT_USE_GPA);
 
 	return 0;

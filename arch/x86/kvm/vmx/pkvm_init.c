@@ -142,6 +142,27 @@ static __init void pkvm_setup_syms(void)
 	pkvm_sym(enable_vpid) = enable_vpid;
 }
 
+static bool __init pkvm_vmx_control_supported(u32 msr, u32 control)
+{
+	u32 low, high;
+
+	if (rdmsr_safe(msr, &low, &high))
+		return false;
+
+	return (high & control) == control;
+}
+
+static bool __init pkvm_pt_vmx_supported(void)
+{
+	/* Keep the RTIT entry/exit controls and PT address translation together. */
+	return pkvm_vmx_control_supported(MSR_IA32_VMX_EXIT_CTLS,
+					 VM_EXIT_CLEAR_IA32_RTIT_CTL) &&
+	       pkvm_vmx_control_supported(MSR_IA32_VMX_ENTRY_CTLS,
+					 VM_ENTRY_LOAD_IA32_RTIT_CTL) &&
+	       pkvm_vmx_control_supported(MSR_IA32_VMX_PROCBASED_CTLS2,
+					 SECONDARY_EXEC_PT_USE_GPA);
+}
+
 static __init int pkvm_setup_host_vmcs_config(void)
 {
 	struct vmcs_config *vmcs_config = &pkvm_sym(host_vmcs_config);
@@ -183,20 +204,18 @@ static __init int pkvm_setup_host_vmcs_config(void)
 	};
 
 	if (boot_cpu_has(X86_FEATURE_INTEL_PT)) {
-		/*
-		 * Enable the RTIT VM-Exit/VM-Entry controls to guarantee the
-		 * deprivileged host cannot profile the pKVM via Intel PT.
-		 *
-		 * Hide the vmx non-root indications and the VMCS packets from
-		 * the Intel PT, and make the output written to the GPA which
-		 * can be translated by the EPT.
-		 */
-		setting.vmexit_ctrl_req |= VM_EXIT_PT_CONCEAL_PIP |
-					   VM_EXIT_CLEAR_IA32_RTIT_CTL;
-		setting.vmentry_ctrl_req |= VM_ENTRY_PT_CONCEAL_PIP |
-					    VM_ENTRY_LOAD_IA32_RTIT_CTL;
-		setting.secondary_vm_exec_ctrl_req |= SECONDARY_EXEC_PT_CONCEAL_VMX |
-						      SECONDARY_EXEC_PT_USE_GPA;
+		setting.vmexit_ctrl_req |= VM_EXIT_PT_CONCEAL_PIP;
+		setting.vmentry_ctrl_req |= VM_ENTRY_PT_CONCEAL_PIP;
+		setting.secondary_vm_exec_ctrl_req |= SECONDARY_EXEC_PT_CONCEAL_VMX;
+		if (pkvm_pt_vmx_supported()) {
+			setting.vmexit_ctrl_req |= VM_EXIT_CLEAR_IA32_RTIT_CTL;
+			setting.vmentry_ctrl_req |= VM_ENTRY_LOAD_IA32_RTIT_CTL;
+			setting.secondary_vm_exec_ctrl_req |= SECONDARY_EXEC_PT_USE_GPA;
+		} else {
+			/* Conceal alone does not guarantee full PT isolation. */
+			pr_warn("PT virtualization controls unavailable; continuing without RTIT switching and PT_USE_GPA. "
+				"Full PT isolation is not guaranteed; do not use for security-sensitive workloads\n");
+		}
 	}
 
 	if (boot_cpu_has(X86_FEATURE_ARCH_LBR)) {
@@ -859,7 +878,7 @@ static __init void init_guest_state_area_from_native(struct vcpu_vmx *vmx)
 		vmcs_write64(GUEST_IA32_PERF_GLOBAL_CTRL, msrq);
 	}
 
-	if (boot_cpu_has(X86_FEATURE_INTEL_PT)) {
+	if (pkvm_sym(host_vmcs_config).vmentry_ctrl & VM_ENTRY_LOAD_IA32_RTIT_CTL) {
 		rdmsrq(MSR_IA32_RTIT_CTL, msrq);
 		vmcs_write64(GUEST_IA32_RTIT_CTL, msrq);
 	}
@@ -1048,7 +1067,7 @@ static __init void init_execution_control(struct vcpu_vmx *vmx)
 	 * SECONDARY_EXEC_ENABLE_EPT bit. Remove it at this point
 	 * and re-enable it after the EPT is enabled.
 	 */
-	if (boot_cpu_has(X86_FEATURE_INTEL_PT))
+	if (pkvm_sym(host_vmcs_config).cpu_based_2nd_exec_ctrl & SECONDARY_EXEC_PT_USE_GPA)
 		secondary_exec_controls_clearbit(vmx, SECONDARY_EXEC_PT_USE_GPA);
 
 	/* Host VM owns cr3 */
@@ -1099,7 +1118,7 @@ static __init void init_vmentry_control(struct vcpu_vmx *vmx)
 	if (!pmu->global_ctrl)
 		vmentry_ctrl &= ~VM_ENTRY_LOAD_IA32_PERF_GLOBAL_CTRL;
 
-	if (boot_cpu_has(X86_FEATURE_INTEL_PT)) {
+	if (vmentry_ctrl & VM_ENTRY_LOAD_IA32_RTIT_CTL) {
 		u64 rtit;
 
 		rdmsrq(MSR_IA32_RTIT_CTL, rtit);
