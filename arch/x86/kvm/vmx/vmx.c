@@ -8881,8 +8881,17 @@ static __init void vmx_set_cpu_caps(void)
 		kvm_cpu_cap_clear(X86_FEATURE_SGX_EDECCSSA);
 	}
 
-	if (vmx_umip_emulated())
+#ifdef __PKVM_HYP__
+	/* pKVM does not support descriptor-instruction emulation. */
+	if (!boot_cpu_has(X86_FEATURE_UMIP))
+		kvm_cpu_cap_clear(X86_FEATURE_UMIP);
+#else
+	/* Preserve UMIP emulation for ordinary KVM, but not for pKVM. */
+	if (enable_pkvm && !boot_cpu_has(X86_FEATURE_UMIP))
+		kvm_cpu_cap_clear(X86_FEATURE_UMIP);
+	else if (vmx_umip_emulated())
 		kvm_cpu_cap_set(X86_FEATURE_UMIP);
+#endif
 
 	/* CPUID 0xD.1 */
 	if (!cpu_has_vmx_xsaves())
