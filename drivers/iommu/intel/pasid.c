@@ -466,6 +466,10 @@ int pkvm_pasid_set_dma_enabled(struct dmar_domain *domain,
 		ret = PTR_ERR(pte);
 		goto out;
 	}
+	if (READ_ONCE(iommu->invalidation_failed)) {
+		ret = -EIO;
+		goto out;
+	}
 	paused = !pasid_pte_is_present(pte) && pasid_entry_configured(pte);
 	pgtt = pasid_pte_get_pgtt(pte);
 	if (pgtt == PASID_ENTRY_PGTT_SL_ONLY) {
@@ -559,7 +563,9 @@ static void pasid_pte_config_first_level(struct intel_iommu *iommu,
 
 	/* Setup Present and PASID Granular Transfer Type: */
 	pasid_set_translation_type(pte, PASID_ENTRY_PGTT_FL_ONLY);
+#ifndef __PKVM_HYP__
 	pasid_set_present(pte);
+#endif
 }
 
 #ifndef __PKVM_HYP__
@@ -653,7 +659,9 @@ static void pasid_pte_config_second_level(struct intel_iommu *iommu,
 	if (dirty_tracking)
 		pasid_set_ssade(pte);
 
+#ifndef __PKVM_HYP__
 	pasid_set_present(pte);
+#endif
 }
 
 int intel_pasid_setup_second_level(struct intel_iommu *iommu,
@@ -725,6 +733,10 @@ int intel_pasid_setup_second_level(struct intel_iommu *iommu,
 #endif
 	pasid_pte_config_second_level(iommu, pte, pgd_val, domain->agaw,
 				      did, domain->dirty_tracking);
+#ifdef __PKVM_HYP__
+	if (domain == &pt_domain)
+		pasid_set_present(pte);
+#endif
 	spin_unlock(&iommu->lock);
 
 	pasid_flush_caches(iommu, pte, pasid, did);

@@ -35,6 +35,8 @@ int pkvm_iommu_clear_ce(struct clear_ce_data *data)
 	struct intel_iommu *iommu = iommu_from_phys(data->phys);
 	struct device_domain_info info = { 0 };
 	struct dmar_domain *domain;
+	struct pkvm_ptdev *ptdev;
+	int ret;
 
 	if (!iommu)
 		return -EINVAL;
@@ -52,15 +54,35 @@ int pkvm_iommu_clear_ce(struct clear_ce_data *data)
 
 	pkvm_dbg("%s: dev[%x:%x], ats_qdep: %d\n",
 		 __func__, data->bus, data->devfn, data->ats_qdep);
+	ret = pkvm_get_or_create_ptdev(PCI_DEVID(info.bus, info.devfn), &ptdev);
+	if (ret)
+		return ret;
+	pkvm_spin_lock(&ptdev->lock);
+	if (ptdev->dma_domain && ptdev->iommu == iommu &&
+	    ptdev->pasid == IOMMU_NO_PASID)
+		info.ats_qdep = ptdev->ats_qdep;
 	domain_context_clear_one(&info, data->bus, data->devfn, &domain);
-	if (domain) {
+	ret = READ_ONCE(iommu->invalidation_failed) ? -EIO : 0;
+	/* Retain the setup references if invalidation failed. */
+	if (domain && !ret) {
 		pkvm_spin_lock(&domain->lock);
-		pkvm_iommu_remove_pending(domain, &info, IOMMU_NO_PASID);
+		pkvm_iommu_remove_pending(domain, ptdev->bdf, IOMMU_NO_PASID);
+		if (ptdev->dma_domain == domain && ptdev->iommu == iommu &&
+		    ptdev->pasid == IOMMU_NO_PASID) {
+			ptdev->dma_domain = NULL;
+			ptdev->iommu = NULL;
+			ptdev->pasid = 0;
+			ptdev->ats_qdep = 0;
+			pkvm_put_ptdev(ptdev);
+		}
 		pkvm_spin_unlock(&domain->lock);
+		/* Release the domain reference retained by setup. */
 		pkvm_put_iommu_domain(domain);
 	}
+	pkvm_spin_unlock(&ptdev->lock);
+	pkvm_put_ptdev(ptdev);
 
-	return 0;
+	return ret;
 }
 
 static int accept_page_donation(struct intel_iommu *iommu, u64 *donation_page_gpa)
@@ -92,6 +114,7 @@ static int iommu_set_lm_ce(struct set_lm_ce_data *data)
 	u16 bdf = PCI_DEVID(data->bus, data->devfn);
 	struct device_domain_info info = { 0 };
 	struct dmar_domain *domain;
+	struct pkvm_ptdev *ptdev;
 	void *pgd;
 	int ret;
 
@@ -138,17 +161,27 @@ static int iommu_set_lm_ce(struct set_lm_ce_data *data)
 		 data->bus, data->devfn, data->did, domain->pgd,
 		 domain->agaw);
 
+	ret = pkvm_get_or_create_ptdev(PCI_DEVID(info.bus, info.devfn), &ptdev);
+	if (ret)
+		goto put_domain;
+	pkvm_spin_lock(&ptdev->lock);
 	pkvm_spin_lock(&domain->lock);
-	if (domain->pending_dma_blocked || domain->pending_count == MAX_PENDING_BDFS) {
+	/* Only one guest DMA entry may be associated with this device. */
+	if (ptdev->dma_domain || domain->pending_count == MAX_PENDING_BDFS) {
 		ret = -EBUSY;
 	} else {
 		ret = domain_context_mapping_one(domain, iommu, &info, data->did,
 						 data->bus, data->devfn);
 		if (!ret)
-			pkvm_iommu_add_pending(domain, &info, IOMMU_NO_PASID);
+			pkvm_iommu_add_pending(domain, ptdev, &info, IOMMU_NO_PASID);
 	}
 	pkvm_spin_unlock(&domain->lock);
+	pkvm_spin_unlock(&ptdev->lock);
+	/* A guest entry retains both setup references until clear/teardown. */
+	if (ret || domain == &pt_domain)
+		pkvm_put_ptdev(ptdev);
 
+put_domain:
 	if (ret) {
 		pkvm_put_iommu_domain(domain);
 		/*
@@ -262,6 +295,7 @@ static int iommu_pasid_setup_fl(struct pasid_setup_fl_data *data)
 	struct device_domain_info info = { 0 };
 	struct pkvm_device dev = { .info = &info };
 	struct dmar_domain *domain;
+	struct pkvm_ptdev *ptdev;
 	int flags = 0, level, ret;
 	void *pgd;
 
@@ -326,17 +360,26 @@ static int iommu_pasid_setup_fl(struct pasid_setup_fl_data *data)
 		flags |= PASID_FLAG_PAGE_SNOOP;
 	if (level == 5)
 		flags |= PASID_FLAG_FL5LP;
+	ret = pkvm_get_or_create_ptdev(PCI_DEVID(info.bus, info.devfn), &ptdev);
+	if (ret)
+		goto put_domain;
+	pkvm_spin_lock(&ptdev->lock);
 	pkvm_spin_lock(&domain->lock);
-	if (domain->pending_dma_blocked || domain->pending_count == MAX_PENDING_BDFS) {
+	/* Only one guest DMA entry may be associated with this device. */
+	if (ptdev->dma_domain || domain->pending_count == MAX_PENDING_BDFS) {
 		ret = -EBUSY;
 	} else {
 		ret = intel_pasid_setup_first_level(iommu, domain, &dev,
 						    __pkvm_pa(pgd), data->pasid,
 						    data->did, flags);
 		if (!ret)
-			pkvm_iommu_add_pending(domain, &info, data->pasid);
+			pkvm_iommu_add_pending(domain, ptdev, &info, data->pasid);
 	}
 	pkvm_spin_unlock(&domain->lock);
+	pkvm_spin_unlock(&ptdev->lock);
+	/* A guest entry retains both setup references until clear/teardown. */
+	if (ret || domain == &pt_domain)
+		pkvm_put_ptdev(ptdev);
 
 put_domain:
 	if (ret)
@@ -359,6 +402,7 @@ static int iommu_pasid_setup_sl(struct pasid_setup_sl_data *data)
 	struct device_domain_info info = { 0 };
 	struct pkvm_device dev = { .info = &info };
 	struct dmar_domain *domain;
+	struct pkvm_ptdev *ptdev;
 	void *pgd;
 	int ret;
 
@@ -399,16 +443,27 @@ static int iommu_pasid_setup_sl(struct pasid_setup_sl_data *data)
 	pkvm_dbg("%s: dev[%x:%x], pasid: %x ssptptr_gpa: %llx, did: %d\n", __func__,
 		 data->bus, data->devfn, data->pasid, data->ssptptr_gpa, data->did);
 
+	ret = pkvm_get_or_create_ptdev(PCI_DEVID(info.bus, info.devfn), &ptdev);
+	if (ret)
+		goto put_domain;
+	pkvm_spin_lock(&ptdev->lock);
 	pkvm_spin_lock(&domain->lock);
-	if (domain->pending_dma_blocked || domain->pending_count == MAX_PENDING_BDFS) {
+	/* Only one guest DMA entry may be associated with this device. */
+	if (ptdev->dma_domain || domain->pending_count == MAX_PENDING_BDFS) {
 		ret = -EBUSY;
 	} else {
 		ret = intel_pasid_setup_second_level(iommu, domain, &dev,
 						     data->did, data->pasid);
 		if (!ret)
-			pkvm_iommu_add_pending(domain, &info, data->pasid);
+			pkvm_iommu_add_pending(domain, ptdev, &info, data->pasid);
 	}
 	pkvm_spin_unlock(&domain->lock);
+	pkvm_spin_unlock(&ptdev->lock);
+	/* A guest entry retains both setup references until clear/teardown. */
+	if (ret || domain == &pt_domain)
+		pkvm_put_ptdev(ptdev);
+
+put_domain:
 	if (ret)
 		pkvm_put_iommu_domain(domain);
 	/* As in legacy setup, the installed entry retains the domain reference. */
@@ -429,6 +484,8 @@ int pkvm_iommu_pasid_teardown(struct pasid_teardown_data *data)
 	struct device_domain_info info = { 0 };
 	struct pkvm_device dev = { .info = &info };
 	struct dmar_domain *domain;
+	struct pkvm_ptdev *ptdev;
+	int ret;
 
 	if (!iommu)
 		return -EINVAL;
@@ -449,15 +506,35 @@ int pkvm_iommu_pasid_teardown(struct pasid_teardown_data *data)
 
 	pkvm_dbg("%s: dev[%x:%x], pasid: %x, ats_qdep: %d\n", __func__,
 		 data->bus, data->devfn, data->pasid, data->ats_qdep);
+	ret = pkvm_get_or_create_ptdev(PCI_DEVID(info.bus, info.devfn), &ptdev);
+	if (ret)
+		return ret;
+	pkvm_spin_lock(&ptdev->lock);
+	if (ptdev->dma_domain && ptdev->iommu == iommu &&
+	    ptdev->pasid == data->pasid)
+		info.ats_qdep = ptdev->ats_qdep;
 	intel_pasid_tear_down_entry(iommu, &dev, data->pasid, false, &domain);
-	if (domain) {
+	ret = READ_ONCE(iommu->invalidation_failed) ? -EIO : 0;
+	/* Retain the setup references if invalidation failed. */
+	if (domain && !ret) {
 		pkvm_spin_lock(&domain->lock);
-		pkvm_iommu_remove_pending(domain, &info, data->pasid);
+		pkvm_iommu_remove_pending(domain, ptdev->bdf, data->pasid);
+		if (ptdev->dma_domain == domain && ptdev->iommu == iommu &&
+		    ptdev->pasid == data->pasid) {
+			ptdev->dma_domain = NULL;
+			ptdev->iommu = NULL;
+			ptdev->pasid = 0;
+			ptdev->ats_qdep = 0;
+			pkvm_put_ptdev(ptdev);
+		}
 		pkvm_spin_unlock(&domain->lock);
+		/* Release the domain reference retained by setup. */
 		pkvm_put_iommu_domain(domain);
 	}
+	pkvm_spin_unlock(&ptdev->lock);
+	pkvm_put_ptdev(ptdev);
 
-	return 0;
+	return ret;
 }
 
 static int __validate_domain_params(struct intel_iommu *iommu, struct alloc_domain_data *data)

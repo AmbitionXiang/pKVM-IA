@@ -1726,7 +1726,11 @@ int domain_context_mapping_one(struct dmar_domain *domain,
 	context_set_address_width(context, domain->agaw);
 	context_set_translation_type(context, translation);
 	context_set_fault_enable(context);
-	context_set_present(context);
+#ifdef __PKVM_HYP__
+	/* Host-EPT domains cannot expose guest-private memory. */
+	if (domain == &pt_domain)
+#endif
+		context_set_present(context);
 	if (!ecap_coherent(iommu->ecap))
 		clflush_cache_range(context, sizeof(*context));
 	context_present_cache_flush(iommu, did, bus, devfn);
@@ -1752,6 +1756,10 @@ int pkvm_context_set_dma_enabled(struct dmar_domain *domain,
 	context = iommu_context_addr(iommu, info->bus, info->devfn, 0);
 	if (!context) {
 		ret = -ENODEV;
+		goto out;
+	}
+	if (READ_ONCE(iommu->invalidation_failed)) {
+		ret = -EIO;
 		goto out;
 	}
 	paused = context_dma_paused(context);

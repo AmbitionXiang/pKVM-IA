@@ -342,7 +342,7 @@ struct pkvm_ptdev *pkvm_get_ptdev(u16 bdf)
 	return ptdev;
 }
 
-static int __pkvm_get_or_create_ptdev(u16 bdf,
+int pkvm_get_or_create_ptdev(u16 bdf,
 				      struct pkvm_ptdev **ptdev)
 {
 	struct pkvm_ptdev *found;
@@ -580,6 +580,10 @@ static int pkvm_restore_ptdev_bars_locked(struct pkvm_vm *vm,
 	ptdev->assignment_state = PKVM_PTDEV_RESTORING;
 	pkvm_withdraw_ptdev_mmio_contract_locked(vm, ptdev);
 
+	ret = pkvm_iommu_pause_dev_dma(ptdev);
+	if (ret)
+		return ret;
+
 	ret = pkvm_restore_ptdev_mmio_ranges_locked(ptdev);
 	if (ret)
 		return ret;
@@ -595,7 +599,7 @@ int pkvm_attach_ptdev(u16 bdf, struct pkvm_vm *vm)
 	int vm_handle;
 	int ret;
 
-	ret = __pkvm_get_or_create_ptdev(bdf, &ptdev);
+	ret = pkvm_get_or_create_ptdev(bdf, &ptdev);
 	if (ret == -EPERM)
 		pkvm_err("%s: reject bdf 0x%x outside boot manifest\n",
 			 __func__, bdf);
@@ -617,7 +621,7 @@ int pkvm_attach_ptdev(u16 bdf, struct pkvm_vm *vm)
 
 	pkvm_spin_unlock(&ptdev->lock);
 
-	ret = pkvm_iommu_attach_ptdev(bdf, vm_handle);
+	ret = pkvm_iommu_attach_ptdev(ptdev, vm_handle);
 	if (ret) {
 		pkvm_err("%s: pkvm_iommu_attach_ptdev failed bdf=0x%x ret=%d\n",
 			 __func__, bdf, ret);
@@ -822,7 +826,7 @@ static int pkvm_publish_ptdev_mmio_contract_locked(struct pkvm_vm *vm,
 	if (!pkvm_ptdev_allows_guest_bar_mapping_locked(ptdev))
 		return -EAGAIN;
 
-	ret = pkvm_iommu_resume_dev_dma(ptdev->bdf,
+	ret = pkvm_iommu_resume_dev_dma(ptdev,
 					vm->kvm.arch.pkvm.handle);
 	if (ret)
 		return ret;

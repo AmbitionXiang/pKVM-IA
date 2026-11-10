@@ -10,6 +10,8 @@
 #include "pgtable.h"
 
 struct kvm;
+struct intel_iommu;
+struct dmar_domain;
 
 #define PKVM_PTDEV_VM_UNBOUND (-1)
 
@@ -61,6 +63,12 @@ struct pkvm_ptdev {
 
 	pkvm_spinlock_t lock;
 
+	/* One guest DMA entry per device; protected by lock until clear/teardown. */
+	struct intel_iommu *iommu;
+	struct dmar_domain *dma_domain;
+	u32 pasid;
+	u8 ats_qdep;
+
 	int vm_handle;
 	bool guest_contract_published;
 	enum pkvm_ptdev_owner owner;
@@ -77,6 +85,7 @@ struct pkvm_ptdev {
 };
 
 struct pkvm_ptdev *pkvm_get_ptdev(u16 bdf);
+int pkvm_get_or_create_ptdev(u16 bdf, struct pkvm_ptdev **ptdev);
 void pkvm_put_ptdev(struct pkvm_ptdev *ptdev);
 int pkvm_detach_ptdev(struct pkvm_ptdev *ptdev, struct pkvm_vm *vm);
 int pkvm_attach_ptdev(u16 bdf, struct pkvm_vm *vm);

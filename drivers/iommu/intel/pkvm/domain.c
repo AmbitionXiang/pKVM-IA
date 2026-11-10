@@ -9,6 +9,7 @@
 #include "pkvm/memory.h"
 #include "pkvm/vmx/ept.h"
 #include "pkvm/iommu_map.h"
+#include "pkvm/ptdev.h"
 #include "../iommu.h"
 
 /*
@@ -387,40 +388,35 @@ int pkvm_iommu_domain_unmap(u64 pgd_gpa, u64 start_pfn, u64 last_pfn)
 	return 0;
 }
 
-/* Caller holds domain->lock, including while installing/removing the entry. */
+/* Caller holds both locks and retains its ptdev/domain references on success. */
 void pkvm_iommu_add_pending(struct dmar_domain *domain,
+			    struct pkvm_ptdev *ptdev,
 			    struct device_domain_info *info, u32 pasid)
 {
 	struct pkvm_pending_ptdev *pending;
-	u16 bdf = PCI_DEVID(info->bus, info->devfn);
-	int i;
 
 	if (domain == &pt_domain)
 		return;
-	for (i = 0; i < domain->pending_count; i++)
-		if (domain->pending_devs[i].bdf == bdf &&
-		    domain->pending_devs[i].iommu == info->iommu &&
-		    domain->pending_devs[i].pasid == pasid)
-			return;
-	if (WARN_ON(domain->pending_count == MAX_PENDING_BDFS))
-		return;
+
+	ptdev->iommu = info->iommu;
+	ptdev->dma_domain = domain;
+	ptdev->pasid = pasid;
+	ptdev->ats_qdep = info->ats_qdep;
 	pending = &domain->pending_devs[domain->pending_count++];
-	pending->iommu = info->iommu;
-	pending->bdf = bdf;
+	pending->bdf = ptdev->bdf;
 	pending->pasid = pasid;
-	pending->ats_qdep = info->ats_qdep;
+	/* All pending guest-domain entries are installed non-present. */
+	domain->pending_dma_blocked = true;
 }
 
-void pkvm_iommu_remove_pending(struct dmar_domain *domain,
-			       struct device_domain_info *info, u32 pasid)
+void pkvm_iommu_remove_pending(struct dmar_domain *domain, u16 bdf, u32 pasid)
 {
 	int i;
 
 	for (i = 0; i < domain->pending_count; i++) {
 		struct pkvm_pending_ptdev *pending = &domain->pending_devs[i];
 
-		if (pending->bdf != PCI_DEVID(info->bus, info->devfn) ||
-		    pending->iommu != info->iommu || pending->pasid != pasid)
+		if (pending->bdf != bdf || pending->pasid != pasid)
 			continue;
 		*pending = domain->pending_devs[--domain->pending_count];
 		memset(&domain->pending_devs[domain->pending_count], 0,
@@ -432,72 +428,54 @@ void pkvm_iommu_remove_pending(struct dmar_domain *domain,
 }
 
 static int set_pending_dma_enabled(struct dmar_domain *domain,
-				   struct pkvm_pending_ptdev *pending,
-				   bool enabled)
+				   struct pkvm_ptdev *ptdev, bool enabled)
 {
 	struct device_domain_info info = {
-		.iommu = pending->iommu,
-		.bus = PCI_BUS_NUM(pending->bdf),
-		.devfn = pending->bdf & 0xff,
-		.ats_qdep = pending->ats_qdep,
+		.iommu = ptdev->iommu,
+		.bus = PCI_BUS_NUM(ptdev->bdf),
+		.devfn = ptdev->bdf & 0xff,
+		.ats_qdep = ptdev->ats_qdep,
 	};
+	int ret;
 
 	if (sm_supported(info.iommu))
-		return pkvm_pasid_set_dma_enabled(domain, &info, pending->pasid,
-						 enabled);
-	return pkvm_context_set_dma_enabled(domain, &info, enabled);
+		ret = pkvm_pasid_set_dma_enabled(domain, &info, ptdev->pasid,
+						enabled);
+	else
+		ret = pkvm_context_set_dma_enabled(domain, &info, enabled);
+	if (!ret && READ_ONCE(info.iommu->invalidation_failed))
+		ret = -EIO;
+	return ret;
 }
 
-int pkvm_iommu_pause_dev_dma(struct dmar_domain *domain, int vm_handle)
+/* Caller holds ptdev->lock; the association pins the domain. */
+int pkvm_iommu_pause_dev_dma(struct pkvm_ptdev *ptdev)
 {
-	int i, ret;
+	struct dmar_domain *domain = ptdev->dma_domain;
+	int ret;
 
-	/* The map caller holds domain->lock. Never take IOMMU locks under host MMU. */
-	if (!domain || domain == &pt_domain || domain->vm_handle != vm_handle)
-		return -EPERM;
-	for (i = 0; i < domain->pending_count; i++) {
-		ret = set_pending_dma_enabled(domain, &domain->pending_devs[i], false);
-		if (ret)
-			return ret;
-	}
-	/* Publish only after every pending entry has completed invalidation. */
-	WRITE_ONCE(domain->pending_dma_blocked, !!domain->pending_count);
-	return 0;
+	/* No guest DMA entry, or it has already been cleared successfully. */
+	if (!domain)
+		return 0;
+	pkvm_spin_lock(&domain->lock);
+	ret = set_pending_dma_enabled(domain, ptdev, false);
+	pkvm_spin_unlock(&domain->lock);
+	return ret;
 }
 
-/* Return a referenced domain without holding the global lock across IOMMU work. */
-static struct dmar_domain *get_pending_domain(u16 bdf)
+int pkvm_iommu_attach_ptdev(struct pkvm_ptdev *ptdev, int vm_handle)
 {
-	struct dmar_domain *domain = NULL;
-	int i, j;
-
-	pkvm_spin_lock(&iommu_domain_lock);
-	for (i = 0; i < MAX_IOMMU_DOMAIN_NUM; i++) {
-		if (!test_bit(i, iommu_domains_bitmap))
-			continue;
-		for (j = 0; j < READ_ONCE(iommu_domains[i].pending_count); j++) {
-			if (READ_ONCE(iommu_domains[i].pending_devs[j].bdf) == bdf &&
-			    atomic_inc_not_zero(&iommu_domains[i].refcount)) {
-				domain = &iommu_domains[i];
-				goto out;
-			}
-		}
-	}
-out:
-	pkvm_spin_unlock(&iommu_domain_lock);
-	return domain;
-}
-
-int pkvm_iommu_attach_ptdev(u16 bdf, int vm_handle)
-{
-	struct dmar_domain *domain = get_pending_domain(bdf);
+	struct dmar_domain *domain;
 	int i, ret = -ENODEV;
 
+	pkvm_spin_lock(&ptdev->lock);
+	domain = ptdev->dma_domain;
 	if (!domain)
-		return -ENODEV;
+		goto out;
 	pkvm_spin_lock(&domain->lock);
 	for (i = 0; i < domain->pending_count; i++) {
-		if (domain->pending_devs[i].bdf != bdf)
+		if (domain->pending_devs[i].bdf != ptdev->bdf ||
+		    domain->pending_devs[i].pasid != ptdev->pasid)
 			continue;
 		ret = 0;
 		if (domain->vm_handle == PKVM_DOMAIN_UNBOUND ||
@@ -509,13 +487,15 @@ int pkvm_iommu_attach_ptdev(u16 bdf, int vm_handle)
 	}
 	/* Keep pending records until the outer attach has succeeded. */
 	pkvm_spin_unlock(&domain->lock);
-	pkvm_put_iommu_domain(domain);
+out:
+	pkvm_spin_unlock(&ptdev->lock);
 	return ret;
 }
 
-int pkvm_iommu_resume_dev_dma(u16 bdf, int vm_handle)
+/* Caller holds ptdev->lock. */
+int pkvm_iommu_resume_dev_dma(struct pkvm_ptdev *ptdev, int vm_handle)
 {
-	struct dmar_domain *domain = get_pending_domain(bdf);
+	struct dmar_domain *domain = ptdev->dma_domain;
 	int i, ret = -ENODEV;
 
 	if (!domain)
@@ -526,25 +506,18 @@ int pkvm_iommu_resume_dev_dma(u16 bdf, int vm_handle)
 		goto out;
 	}
 	for (i = 0; i < domain->pending_count; i++) {
-		struct pkvm_pending_ptdev *pending = &domain->pending_devs[i];
-		struct device_domain_info info;
-
-		if (pending->bdf != bdf)
+		if (domain->pending_devs[i].bdf != ptdev->bdf ||
+		    domain->pending_devs[i].pasid != ptdev->pasid)
 			continue;
-		/* Resume is a no-op unless this entry was paused by DMA map. */
-		ret = set_pending_dma_enabled(domain, pending, true);
-		if (ret)
-			goto out;
-		memset(&info, 0, sizeof(info));
-		info.iommu = pending->iommu;
-		info.bus = PCI_BUS_NUM(bdf);
-		info.devfn = bdf & 0xff;
-		pkvm_iommu_remove_pending(domain, &info, pending->pasid);
+		/* Setup leaves guest-domain entries paused until BAR revocation. */
+		ret = set_pending_dma_enabled(domain, ptdev, true);
+		if (!ret)
+			pkvm_iommu_remove_pending(domain, ptdev->bdf,
+						  ptdev->pasid);
 		break;
 	}
 out:
 	pkvm_spin_unlock(&domain->lock);
-	pkvm_put_iommu_domain(domain);
 	return ret;
 }
 

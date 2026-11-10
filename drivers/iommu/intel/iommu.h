@@ -662,10 +662,8 @@ struct qi_batch {
 
 #ifdef __PKVM_HYP__
 struct pkvm_pending_ptdev {
-	struct intel_iommu *iommu;
 	u32 pasid;
 	u16 bdf;
-	u8 ats_qdep;
 };
 #endif
 
@@ -914,6 +912,8 @@ struct intel_iommu {
 	 * translation structures.
 	 */
 	void		*donation_page;
+	/* A failed invalidation must never permit device handoff. */
+	bool		invalidation_failed;
 	pkvm_spinlock_t lock;
 };
 
