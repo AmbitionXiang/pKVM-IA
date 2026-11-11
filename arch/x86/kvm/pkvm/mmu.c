@@ -1870,6 +1870,31 @@ static int check_vm_dma_pages(unsigned long phys, unsigned long size)
 	return 0;
 }
 
+#ifdef CONFIG_PKVM_INTEL
+/* Pause before pinning guest pages; revalidate after dropping the MMU lock. */
+static int pause_pending_dma(unsigned long phys, unsigned long size,
+			     struct dmar_domain *domain, int vm_handle)
+{
+	int ret, hpa_vm;
+
+	pkvm_host_mmu_unlock();
+	ret = pkvm_iommu_pause_pending_dma(domain, vm_handle);
+	pkvm_host_mmu_lock();
+	if (ret)
+		return ret;
+
+	hpa_vm = pkvm_lookup_hpa_vm(phys, phys + size);
+	if (hpa_vm >= 0)
+		pkvm_put_vm_handle(hpa_vm);
+	if (hpa_vm != vm_handle)
+		return -EPERM;
+	ret = check_vm_dma_pages(phys, size);
+	if (ret)
+		return ret;
+	return pkvm_iommu_vm_dma_ready(vm_handle, domain) ? 0 : -EPERM;
+}
+#endif
+
 /**
  * pkvm_host_use_dma() - Validate a DMA range and pin its RAM pages.
  * @phys: Physical start address of the DMA range.
@@ -1942,7 +1967,8 @@ int pkvm_host_use_dma(unsigned long phys, unsigned long size,
 					 */
 #ifdef CONFIG_PKVM_INTEL
 					if (!pkvm_iommu_vm_dma_ready(vm_handle, domain))
-						ret = -EPERM;
+						ret = pause_pending_dma(phys, size,
+									domain, vm_handle);
 #else
 					ret = -EPERM;
 #endif

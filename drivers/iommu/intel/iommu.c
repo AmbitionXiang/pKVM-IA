@@ -1727,8 +1727,8 @@ int domain_context_mapping_one(struct dmar_domain *domain,
 	context_set_translation_type(context, translation);
 	context_set_fault_enable(context);
 #ifdef __PKVM_HYP__
-	/* Host-EPT domains cannot expose guest-private memory. */
-	if (domain == &pt_domain)
+	/* VM domains may already contain guest-private mappings. */
+	if (domain->vm_handle < 0)
 #endif
 		context_set_present(context);
 	if (!ecap_coherent(iommu->ecap))

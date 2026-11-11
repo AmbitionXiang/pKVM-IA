@@ -629,6 +629,10 @@ int intel_pasid_setup_first_level(struct intel_iommu *iommu,
 	}
 #endif
 	pasid_pte_config_first_level(iommu, pte, fsptptr, did, flags);
+#ifdef __PKVM_HYP__
+	if (domain->vm_handle < 0)
+		pasid_set_present(pte);
+#endif
 
 	spin_unlock(&iommu->lock);
 
@@ -734,7 +738,7 @@ int intel_pasid_setup_second_level(struct intel_iommu *iommu,
 	pasid_pte_config_second_level(iommu, pte, pgd_val, domain->agaw,
 				      did, domain->dirty_tracking);
 #ifdef __PKVM_HYP__
-	if (domain == &pt_domain)
+	if (domain->vm_handle < 0)
 		pasid_set_present(pte);
 #endif
 	spin_unlock(&iommu->lock);

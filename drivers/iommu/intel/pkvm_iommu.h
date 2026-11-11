@@ -219,6 +219,8 @@ bool pkvm_iommu_vm_domains_ready(int vm_handle);
 bool pkvm_iommu_vm_dma_ready(int vm_handle, struct dmar_domain *mapping_domain);
 /* Caller holds ptdev->lock for pause/resume. */
 int pkvm_iommu_pause_dev_dma(struct pkvm_ptdev *ptdev);
+/* Caller holds domain->lock, but not the host MMU lock. */
+int pkvm_iommu_pause_pending_dma(struct dmar_domain *domain, int vm_handle);
 int pkvm_iommu_resume_dev_dma(struct pkvm_ptdev *ptdev, int vm_handle);
 void pkvm_iommu_add_pending(struct dmar_domain *domain,
 			    struct pkvm_ptdev *ptdev,

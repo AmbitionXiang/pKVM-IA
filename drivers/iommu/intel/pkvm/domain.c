@@ -35,6 +35,7 @@ void init_pt_domain(void)
 	INIT_LIST_HEAD(&pt_domain.cache_tags);
 	pkvm_spin_lock_init(&pt_domain.lock);
 	pkvm_spin_lock_init(&pt_domain.cache_lock);
+	pt_domain.vm_handle = PKVM_DOMAIN_HOST;
 	pt_domain.qi_batch = &pt_domain._qi_batch;
 	pt_domain.pgd = __pkvm_va(pkvm_host_ept_root());
 	pt_domain.agaw = level_to_agaw(pkvm_host_ept_level());
@@ -405,8 +406,9 @@ void pkvm_iommu_add_pending(struct dmar_domain *domain,
 	pending = &domain->pending_devs[domain->pending_count++];
 	pending->bdf = ptdev->bdf;
 	pending->pasid = pasid;
-	/* All pending guest-domain entries are installed non-present. */
-	domain->pending_dma_blocked = true;
+	/* A paused new entry does not imply that earlier entries are paused. */
+	domain->pending_dma_blocked = domain->vm_handle >= 0 &&
+		(domain->pending_count == 1 || domain->pending_dma_blocked);
 }
 
 void pkvm_iommu_remove_pending(struct dmar_domain *domain, u16 bdf, u32 pasid)
@@ -446,6 +448,29 @@ static int set_pending_dma_enabled(struct dmar_domain *domain,
 	if (!ret && READ_ONCE(info.iommu->invalidation_failed))
 		ret = -EIO;
 	return ret;
+}
+
+/* Caller holds domain->lock, but not the host MMU lock. */
+int pkvm_iommu_pause_pending_dma(struct dmar_domain *domain, int vm_handle)
+{
+	int i, ret;
+
+	if (!domain || domain == &pt_domain || domain->vm_handle != vm_handle)
+		return -EPERM;
+	for (i = 0; i < domain->pending_count; i++) {
+		struct pkvm_ptdev *ptdev;
+
+		ptdev = pkvm_get_ptdev(domain->pending_devs[i].bdf);
+		if (!ptdev)
+			return -ENODEV;
+		/* The domain lock keeps the setup association stable. */
+		ret = set_pending_dma_enabled(domain, ptdev, false);
+		pkvm_put_ptdev(ptdev);
+		if (ret)
+			return ret;
+	}
+	domain->pending_dma_blocked = !!domain->pending_count;
+	return 0;
 }
 
 /* Caller holds ptdev->lock; the association pins the domain. */
@@ -509,7 +534,7 @@ int pkvm_iommu_resume_dev_dma(struct pkvm_ptdev *ptdev, int vm_handle)
 		if (domain->pending_devs[i].bdf != ptdev->bdf ||
 		    domain->pending_devs[i].pasid != ptdev->pasid)
 			continue;
-		/* Setup leaves guest-domain entries paused until BAR revocation. */
+		/* Guest DMA is enabled only after host BAR revocation. */
 		ret = set_pending_dma_enabled(domain, ptdev, true);
 		if (!ret)
 			pkvm_iommu_remove_pending(domain, ptdev->bdf,
