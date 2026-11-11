@@ -77,11 +77,17 @@ struct pkvm_vm {
 	/* Linked list of passthrough devices assigned to this VM */
 	struct list_head ptdev_head;
 	/* MMIO allowlist for guest */
+	/* Protected by lock; prevents finalize during BAR publication. */
+	bool mmio_metadata_busy;
 	u16 mmio_allow_nr_ranges;
 	u16 mmio_allow_generation;
 	u32 mmio_allow_flags;
 	struct pkvm_guest_mmio_allow_range
 		mmio_allow_ranges[PKVM_GUEST_MMIO_ALLOW_MAX_RANGES];
+	/* Internal ownership tags; not part of the guest ABI. */
+	u16 mmio_allow_owner_bdf[PKVM_GUEST_MMIO_ALLOW_MAX_RANGES];
+	/* Trusted HPA starts paired with the guest-visible GPA ranges. */
+	u64 mmio_allow_hpa[PKVM_GUEST_MMIO_ALLOW_MAX_RANGES];
 #endif
 	/*
 	 * The struct kvm should be the last element. In cases where struct kvm
