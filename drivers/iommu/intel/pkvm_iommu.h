@@ -30,6 +30,7 @@ struct qi_desc;
 struct intel_iommu;
 struct dmar_domain;
 struct device_domain_info;
+struct pkvm_ptdev;
 struct irte;
 
 #ifdef CONFIG_PKVM_INTEL
@@ -213,8 +214,23 @@ int pkvm_iommu_domain_map(struct domain_map_data *in, struct domain_map_data *ou
 int pkvm_iommu_domain_unmap(u64 pgd_gpa, u64 start_pfn, u64 last_pfn);
 int pkvm_iommu_modify_irte(struct modify_irte_data *data);
 
-int pkvm_iommu_attach_ptdev(u16 bdf, int vm_handle);
+int pkvm_iommu_attach_ptdev(struct pkvm_ptdev *ptdev, int vm_handle);
 bool pkvm_iommu_vm_domains_ready(int vm_handle);
+bool pkvm_iommu_vm_dma_ready(int vm_handle, struct dmar_domain *mapping_domain);
+/* Caller holds ptdev->lock for pause/resume. */
+int pkvm_iommu_pause_dev_dma(struct pkvm_ptdev *ptdev);
+/* Caller holds domain->lock, but not the host MMU lock. */
+int pkvm_iommu_pause_pending_dma(struct dmar_domain *domain, int vm_handle);
+int pkvm_iommu_resume_dev_dma(struct pkvm_ptdev *ptdev, int vm_handle);
+void pkvm_iommu_add_pending(struct dmar_domain *domain,
+			    struct pkvm_ptdev *ptdev,
+			    struct device_domain_info *info, u32 pasid);
+void pkvm_iommu_remove_pending(struct dmar_domain *domain, u16 bdf, u32 pasid);
+int pkvm_context_set_dma_enabled(struct dmar_domain *domain,
+				 struct device_domain_info *info, bool enabled);
+int pkvm_pasid_set_dma_enabled(struct dmar_domain *domain,
+			       struct device_domain_info *info, u32 pasid,
+			       bool enabled);
 
 /*
  * Return value from a pKVM MMIO register validator meaning "this offset is not

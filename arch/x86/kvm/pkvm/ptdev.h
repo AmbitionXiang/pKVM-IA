@@ -10,6 +10,8 @@
 #include "pgtable.h"
 
 struct kvm;
+struct intel_iommu;
+struct dmar_domain;
 
 #define PKVM_PTDEV_VM_UNBOUND (-1)
 
@@ -59,6 +61,12 @@ struct pkvm_ptdev {
 
 	pkvm_spinlock_t lock;
 
+	/* One guest DMA entry per device; protected by lock until clear/teardown. */
+	struct intel_iommu *iommu;
+	struct dmar_domain *dma_domain;
+	u32 pasid;
+	u8 ats_qdep;
+
 	int vm_handle;
 	bool guest_contract_published;
 	enum pkvm_ptdev_owner owner;
@@ -75,6 +83,7 @@ struct pkvm_ptdev {
 };
 
 struct pkvm_ptdev *pkvm_get_ptdev(u16 bdf);
+int pkvm_get_or_create_ptdev(u16 bdf, struct pkvm_ptdev **ptdev);
 void pkvm_put_ptdev(struct pkvm_ptdev *ptdev);
 int pkvm_detach_ptdev(struct pkvm_ptdev *ptdev, struct pkvm_vm *vm);
 int pkvm_attach_ptdev(u16 bdf, struct pkvm_vm *vm);
@@ -92,8 +101,8 @@ int pkvm_handle_ptdev_mmio_info(struct kvm_vcpu *vcpu, gpa_t guest_gpa,
 				unsigned long size);
 int pkvm_handle_ptdev_mmio_read(struct kvm_vcpu *vcpu, gpa_t guest_gpa,
 				u16 nr_ranges, u16 start);
-int pkvm_handle_ptdev_pci_list(struct kvm_vcpu *vcpu, gpa_t guest_gpa,
-			       u64 max_entries);
+int pkvm_handle_ptdev_pdma_allowed(struct kvm_vcpu *vcpu, u64 guest_segment,
+				   u64 guest_bdf);
 bool pkvm_host_hpa_hits_boot_ptdev_bar(u64 hpa, u64 size);
 bool pkvm_vm_hpa_hits_attached_boot_ptdev_bar(struct kvm *kvm, u64 hpa, u64 size);
 bool pkvm_is_boot_ptdev(u16 bdf);

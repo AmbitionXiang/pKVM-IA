@@ -15218,8 +15218,8 @@ int pkvm_emulate_hypercall(struct kvm_vcpu *vcpu)
 		}
 		break;
 #if IS_ENABLED(CONFIG_PKVM_INTEL)
-	case PKVM_GHC_PTDEV_PCI_LIST:
-		ret = pkvm_handle_ptdev_pci_list(vcpu, a0, a1);
+	case PKVM_GHC_PTDEV_PDMA_ALLOWED:
+		ret = pkvm_handle_ptdev_pdma_allowed(vcpu, a0, a1);
 		break;
 	case PKVM_GHC_PTDEV_MMIO_INFO:
 		ret = pkvm_handle_ptdev_mmio_info(vcpu, a0, a1);

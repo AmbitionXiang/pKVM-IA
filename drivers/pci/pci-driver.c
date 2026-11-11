@@ -432,6 +432,18 @@ static inline bool pci_device_can_probe(struct pci_dev *pdev)
 }
 #endif
 
+/**
+ * arch_pci_refresh_mmio_allowlist - Refresh global MMIO permissions before probe
+ * @pdev: PCI device about to be probed
+ *
+ * Architectures may refresh their MMIO allowlist for boot-time and hot-added
+ * devices here. Return zero on success or a negative error to abort probe.
+ */
+int __weak arch_pci_refresh_mmio_allowlist(struct pci_dev *pdev)
+{
+	return 0;
+}
+
 static int pci_device_probe(struct device *dev)
 {
 	int error;
@@ -440,6 +452,12 @@ static int pci_device_probe(struct device *dev)
 
 	if (!pci_device_can_probe(pci_dev))
 		return -ENODEV;
+
+	error = arch_pci_refresh_mmio_allowlist(pci_dev);
+	if (error) {
+		pci_err(pci_dev, "failed to refresh MMIO allowlist: %d\n", error);
+		return error;
+	}
 
 	pci_assign_irq(pci_dev);
 

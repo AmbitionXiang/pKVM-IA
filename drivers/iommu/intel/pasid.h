@@ -84,6 +84,19 @@ static inline u16 pasid_pte_get_pgtt(struct pasid_entry *pte)
 	return (u16)((READ_ONCE(pte->val[0]) >> 6) & 0x7);
 }
 
+/*
+ * pKVM keeps PGTT while paused and clears it on teardown, under iommu->lock.
+ * An FPD-only entry has no translation configuration and is not paused.
+ */
+static inline bool pasid_entry_configured(struct pasid_entry *pte)
+{
+#ifdef __PKVM_HYP__
+	return pasid_pte_is_present(pte) || pasid_pte_get_pgtt(pte);
+#else
+	return pasid_pte_is_present(pte);
+#endif
+}
+
 static inline void pasid_clear_entry(struct pasid_entry *pe)
 {
 	WRITE_ONCE(pe->val[0], 0);
