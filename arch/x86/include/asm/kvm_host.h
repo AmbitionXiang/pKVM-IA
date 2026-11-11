@@ -816,6 +816,7 @@ struct kvm_pkvm_vm {
 	bool finalized;
 	struct mutex finalized_lock;
 #ifdef CONFIG_PKVM_INTEL
+	/* Synchronous submission mailbox, serialized by finalized_lock. */
 	bool ptdev_mmio_metadata_valid;
 	struct kvm_ptdev_mmio_metadata ptdev_mmio_metadata;
 #endif

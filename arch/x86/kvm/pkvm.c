@@ -205,19 +205,6 @@ static int pkvm_validate_ptdev_mmio_range(
 	return 0;
 }
 
-static bool pkvm_ptdev_mmio_metadata_equal(
-	const struct kvm_ptdev_mmio_metadata *left,
-	const struct kvm_ptdev_mmio_metadata *right)
-{
-	if (left->segment != right->segment || left->bdf != right->bdf ||
-	    left->nr_ranges != right->nr_ranges ||
-	    left->generation != right->generation || left->flags != right->flags)
-		return false;
-
-	return !memcmp(left->ranges, right->ranges,
-		       left->nr_ranges * sizeof(left->ranges[0]));
-}
-
 static int pkvm_copy_ptdev_mmio_metadata_from_user(
 	struct kvm_ptdev_mmio_metadata *kmeta,
 	struct kvm_protected_vm_ptdev_mmio_metadata __user *umeta)
@@ -421,22 +408,14 @@ static int pkvm_vm_ioctl_set_ptdev_mmio_metadata(
 		goto out;
 	}
 
-	if (pkvm->ptdev_mmio_metadata_valid) {
-		ret = pkvm_ptdev_mmio_metadata_equal(&pkvm->ptdev_mmio_metadata,
-						     &kmeta) ?
-		      0 : -EBUSY;
-		goto out;
-	}
-
+	/* The hypervisor keeps immutable metadata per device, not per VM. */
 	pkvm->ptdev_mmio_metadata = kmeta;
 	pkvm->ptdev_mmio_metadata_valid = true;
 
 	ret = pkvm_sync_ptdev_mmio_metadata(kvm);
-	if (ret) {
-		memset(&pkvm->ptdev_mmio_metadata, 0,
-		       sizeof(pkvm->ptdev_mmio_metadata));
-		pkvm->ptdev_mmio_metadata_valid = false;
-	}
+	memset(&pkvm->ptdev_mmio_metadata, 0,
+	       sizeof(pkvm->ptdev_mmio_metadata));
+	pkvm->ptdev_mmio_metadata_valid = false;
 out:
 	mutex_unlock(&pkvm->finalized_lock);
 	return ret;

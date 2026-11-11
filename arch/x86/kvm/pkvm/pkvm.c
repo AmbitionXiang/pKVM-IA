@@ -421,6 +421,13 @@ static int pkvm_vm_finalize(int vm_handle)
 		ret = -EBUSY;
 		goto unlock;
 	}
+#ifdef CONFIG_PKVM_INTEL
+	/* Do not start guest execution halfway through BAR publication. */
+	if (pkvm_vm->mmio_metadata_busy) {
+		ret = -EBUSY;
+		goto unlock;
+	}
+#endif
 
 	pvmfw_load_addr = READ_ONCE(shared_kvm->arch.pkvm.pvmfw_load_addr);
 	if (pvmfw_load_addr != INVALID_GPA) {
@@ -1855,12 +1862,13 @@ static int pkvm_vm_mmu_map(unsigned long gpa, unsigned long hpa,
 			return -EPERM;
 		}
 
-		if (pkvm_vm_hpa_hits_attached_boot_ptdev_bar(kvm, hpa, size)) {
+		if (pkvm_vm_mmio_mapping_allowed(to_pkvm(kvm), gpa, hpa, size)) {
 			pkvm_err("pkvm: vm_mmu_map: attached BAR gpa=0x%lx hpa=0x%lx size=0x%lx\n",
 				 gpa, hpa, size);
 			ret = pkvm_host_map_guest_mmio(vcpu, gpa, hpa, size);
-		} else if (pkvm_host_hpa_hits_boot_ptdev_bar(hpa, size)) {
-			pkvm_err("pkvm: vm_mmu_map: reject boot ptdev BAR HPA not attached to VM gpa=0x%lx hpa=0x%lx size=0x%lx\n",
+		} else if (pkvm_vm_gpa_overlaps_mmio(to_pkvm(kvm), gpa, size) ||
+			   pkvm_host_hpa_hits_boot_ptdev_bar(hpa, size)) {
+			pkvm_err("pkvm: vm_mmu_map: reject BAR outside published GPA/HPA contract gpa=0x%lx hpa=0x%lx size=0x%lx\n",
 				 gpa, hpa, size);
 			ret = -EPERM;
 		} else {
@@ -2176,6 +2184,7 @@ static int pkvm_hc_register_hpa_vm(u64 hpa_start, u64 hpa_end, int vm_handle)
 
 static int pkvm_hc_sync_ptdev_mmio_metadata(int vm_handle)
 {
+	struct kvm_ptdev_mmio_metadata metadata;
 	struct pkvm_vm *pkvm_vm;
 	struct kvm *shared_kvm;
 	int ret;
@@ -2191,13 +2200,15 @@ static int pkvm_hc_sync_ptdev_mmio_metadata(int vm_handle)
 		goto out;
 	}
 
-	if (!shared_kvm->arch.pkvm.ptdev_mmio_metadata_valid) {
+	if (!READ_ONCE(shared_kvm->arch.pkvm.ptdev_mmio_metadata_valid)) {
 		ret = -EINVAL;
 		goto out;
 	}
 
-	ret = pkvm_set_ptdev_mmio_metadata(pkvm_vm,
-					   &shared_kvm->arch.pkvm.ptdev_mmio_metadata);
+	/* Never validate one version of host-owned memory and use another. */
+	memcpy(&metadata, &shared_kvm->arch.pkvm.ptdev_mmio_metadata,
+	       sizeof(metadata));
+	ret = pkvm_set_ptdev_mmio_metadata(pkvm_vm, &metadata);
 out:
 	pkvm_put_vm(pkvm_vm);
 	return ret;
