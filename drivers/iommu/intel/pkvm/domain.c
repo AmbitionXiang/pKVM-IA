@@ -5,10 +5,12 @@
 #include <linux/hashtable.h>
 #include <asm/pkvm_spinlock.h>
 #include "pkvm.h"
+#include "pkvm/ptdev.h"
 #include "pkvm/debug.h"
 #include "pkvm/memory.h"
 #include "pkvm/vmx/ept.h"
 #include "pkvm/iommu_map.h"
+#include "../pkvm_iommu.h"
 #include "../iommu.h"
 
 /*
@@ -20,6 +22,257 @@ static DEFINE_HASHTABLE(iommu_domain_hasht, 8);
 static DECLARE_BITMAP(iommu_domains_bitmap, MAX_IOMMU_DOMAIN_NUM);
 static struct dmar_domain iommu_domains[MAX_IOMMU_DOMAIN_NUM];
 static DEFINE_PKVM_SPINLOCK(iommu_domain_lock);
+/* Serializes P2P contract collection, mapping and release. */
+static DEFINE_PKVM_SPINLOCK(pkvm_p2p_lock);
+
+#ifdef __PKVM_HYP__
+static struct pkvm_p2p_contract pkvm_p2p_contracts[MAX_PKVM_VMS];
+
+static bool pkvm_p2p_owner_is_attached(struct pkvm_vm *vm, u16 bdf)
+{
+	struct pkvm_ptdev *ptdev;
+
+	list_for_each_entry(ptdev, &vm->ptdev_head, vm_node)
+		if (ptdev->bdf == bdf && ptdev->vm_handle ==
+		    vm->kvm.arch.pkvm.handle)
+			return true;
+
+	return false;
+}
+
+/* Caller holds vm->lock and domain->cache_lock. */
+static int pkvm_p2p_domain_is_used(struct pkvm_vm *vm,
+				   struct dmar_domain *domain)
+{
+	struct cache_tag *tag;
+	int used = 0;
+
+	list_for_each_entry(tag, &domain->cache_tags, node) {
+		if (tag->type != CACHE_TAG_IOTLB)
+			continue;
+		if (!pkvm_p2p_owner_is_attached(vm,
+					      PCI_DEVID(tag->bus, tag->devfn))) {
+			used = -EPERM;
+			break;
+		}
+		used = 1;
+	}
+	return used;
+}
+
+/* Publish membership under the same lock used to validate source bindings. */
+static int pkvm_p2p_collect_domain(struct pkvm_p2p_contract *contract,
+				   struct dmar_domain *domain)
+{
+	int ret;
+
+	pkvm_spin_lock(&domain->cache_lock);
+	ret = pkvm_p2p_domain_is_used(contract->vm, domain);
+	if (ret <= 0 || domain->p2p_contract == contract)
+		goto out;
+	if (domain->p2p_contract) {
+		ret = -EPERM;
+		goto out;
+	}
+	if (contract->domain_count == PKVM_P2P_MAX_DOMAINS) {
+		ret = -E2BIG;
+		goto out;
+	}
+	atomic_inc(&domain->refcount);
+	contract->domains[contract->domain_count++] = domain;
+	domain->p2p_contract = contract;
+out:
+	pkvm_spin_unlock(&domain->cache_lock);
+	return ret;
+}
+
+static void pkvm_p2p_release_contract(struct pkvm_p2p_contract *contract)
+{
+	unsigned int d;
+
+	for (d = 0; d < contract->domain_count; d++) {
+		struct dmar_domain *domain = contract->domains[d];
+
+		pkvm_spin_lock(&domain->cache_lock);
+		domain->p2p_contract = NULL;
+		pkvm_spin_unlock(&domain->cache_lock);
+		pkvm_put_iommu_domain(domain);
+	}
+	memset(contract, 0, sizeof(*contract));
+}
+
+static int pkvm_p2p_collect_contract(struct pkvm_vm *vm,
+				     struct pkvm_p2p_contract *contract)
+{
+	struct dmar_domain *domain;
+	int i, ret;
+
+	if (vm->mmio_allow_nr_ranges > PKVM_P2P_MAX_RANGES)
+		return -E2BIG;
+
+	for (i = 0; i < vm->mmio_allow_nr_ranges; i++) {
+		u64 hpa = vm->mmio_allow_hpa[i];
+		u64 size = vm->mmio_allow_ranges[i].size;
+		u64 gpa = vm->mmio_allow_ranges[i].guest_gpa;
+		u16 bdf = vm->mmio_allow_owner_bdf[i];
+
+		if (!size || !PAGE_ALIGNED(gpa) || !PAGE_ALIGNED(hpa) ||
+		    !PAGE_ALIGNED(size) || gpa > U64_MAX - size ||
+		    hpa > U64_MAX - size ||
+		    !pkvm_p2p_owner_is_attached(vm, bdf))
+			return -EINVAL;
+
+		contract->ranges[i] = (struct pkvm_p2p_range) {
+			.iova = gpa,
+			.hpa = hpa,
+			.size = size,
+			.owner_bdf = bdf,
+		};
+	}
+	contract->range_count = vm->mmio_allow_nr_ranges;
+
+	for (i = 0; i < MAX_IOMMU_DOMAIN_NUM; i++) {
+		if (!test_bit(i, iommu_domains_bitmap))
+			continue;
+		domain = &iommu_domains[i];
+		if (domain->vm_handle != vm->kvm.arch.pkvm.handle)
+			continue;
+		ret = pkvm_p2p_collect_domain(contract, domain);
+		if (ret < 0)
+			return ret;
+	}
+
+	return contract->domain_count ? 0 : -ENODEV;
+}
+
+/* Caller holds domain->lock. Only pass ranges prechecked for this transaction. */
+static void pkvm_p2p_unmap_bars(struct pkvm_p2p_contract *contract,
+				struct dmar_domain *domain, unsigned int ranges)
+{
+	unsigned int r;
+
+	for (r = 0; r < ranges; r++) {
+		struct pkvm_p2p_range *range = &contract->ranges[r];
+
+		domain_unmap(domain, range->iova >> VTD_PAGE_SHIFT,
+			     (range->iova + range->size - 1) >> VTD_PAGE_SHIFT,
+			     NULL);
+	}
+}
+
+int pkvm_iommu_map_p2p(int vm_handle)
+{
+	struct pkvm_vm *vm = pkvm_get_vm(vm_handle);
+	struct pkvm_p2p_contract *contract;
+	unsigned int d, r;
+	int ret;
+
+	if (!vm)
+		return -EINVAL;
+
+	/* Match allowlist withdrawal: vm->lock precedes pkvm_p2p_lock. */
+	pkvm_spin_lock(&vm->lock);
+	pkvm_spin_lock(&pkvm_p2p_lock);
+	contract = &pkvm_p2p_contracts[vm_handle];
+	if (contract->vm) {
+		ret = contract->vm == vm ? 0 : -EPERM;
+		goto out_unlock;
+	}
+
+	if (!vm->mmio_allow_nr_ranges) {
+		ret = -EAGAIN;
+		goto out_unlock;
+	}
+	memset(contract, 0, sizeof(*contract));
+	contract->vm = vm;
+	pkvm_spin_lock(&iommu_domain_lock);
+	ret = pkvm_p2p_collect_contract(vm, contract);
+	pkvm_spin_unlock(&iommu_domain_lock);
+	if (ret) {
+		pkvm_p2p_release_contract(contract);
+		goto out_unlock;
+	}
+
+	/* Keep each domain locked from precheck through mapping or local rollback. */
+	for (d = 0; d < contract->domain_count; d++) {
+		struct dmar_domain *domain = contract->domains[d];
+
+		pkvm_spin_lock(&domain->lock);
+		for (r = 0; r < contract->range_count; r++) {
+			struct pkvm_p2p_range *range = &contract->ranges[r];
+
+			ret = pkvm_domain_range_empty(domain,
+					range->iova >> VTD_PAGE_SHIFT,
+					range->size >> VTD_PAGE_SHIFT);
+			if (ret)
+				break;
+		}
+		if (ret) {
+			pkvm_spin_unlock(&domain->lock);
+			goto rollback;
+		}
+		for (r = 0; r < contract->range_count; r++) {
+			struct pkvm_p2p_range *range = &contract->ranges[r];
+
+			ret = pkvm_domain_map_peer(domain,
+					range->iova >> VTD_PAGE_SHIFT,
+					range->hpa >> VTD_PAGE_SHIFT,
+					range->size >> VTD_PAGE_SHIFT);
+			if (ret) {
+				/* Include the range whose map may have partially succeeded. */
+				pkvm_p2p_unmap_bars(contract, domain, r + 1);
+				break;
+			}
+		}
+		pkvm_spin_unlock(&domain->lock);
+		if (ret)
+			goto rollback;
+	}
+
+	ret = 0;
+	vm->p2p_contract = contract;
+	goto out_unlock;
+
+rollback:
+	/* The current domain was either untouched or rolled back under its lock. */
+	while (d) {
+		struct dmar_domain *domain = contract->domains[--d];
+
+		pkvm_spin_lock(&domain->lock);
+		pkvm_p2p_unmap_bars(contract, domain, contract->range_count);
+		pkvm_spin_unlock(&domain->lock);
+	}
+	pkvm_p2p_release_contract(contract);
+out_unlock:
+	pkvm_spin_unlock(&pkvm_p2p_lock);
+	pkvm_spin_unlock(&vm->lock);
+	pkvm_put_vm(vm);
+	return ret;
+}
+
+void pkvm_iommu_unmap_p2p(struct pkvm_vm *vm)
+{
+	struct pkvm_p2p_contract *contract;
+	unsigned int d;
+
+	pkvm_spin_lock(&pkvm_p2p_lock);
+	contract = vm->p2p_contract;
+	if (!contract)
+		goto out;
+	for (d = 0; d < contract->domain_count; d++) {
+		struct dmar_domain *domain = contract->domains[d];
+
+		pkvm_spin_lock(&domain->lock);
+		pkvm_p2p_unmap_bars(contract, domain, contract->range_count);
+		pkvm_spin_unlock(&domain->lock);
+	}
+	pkvm_p2p_release_contract(contract);
+	vm->p2p_contract = NULL;
+out:
+	pkvm_spin_unlock(&pkvm_p2p_lock);
+}
+
+#endif
 
 /*
  * Passthrough domain for implementing passthrough (identity) mode for the host,

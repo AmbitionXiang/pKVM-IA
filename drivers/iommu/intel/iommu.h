@@ -660,6 +660,28 @@ struct qi_batch {
 #define PKVM_DOMAIN_HOST (-2)
 /* domain.vm_handle >= 0 indicates this domain is bound to a pVM */
 
+#ifdef __PKVM_HYP__
+struct pkvm_vm;
+struct dmar_domain;
+#define PKVM_P2P_MAX_DOMAINS	64
+#define PKVM_P2P_MAX_RANGES	64
+
+struct pkvm_p2p_range {
+	u64 iova;
+	u64 hpa;
+	u64 size;
+	u16 owner_bdf;
+};
+
+struct pkvm_p2p_contract {
+	struct pkvm_vm *vm;
+	struct dmar_domain *domains[PKVM_P2P_MAX_DOMAINS];
+	u16 domain_count;
+	struct pkvm_p2p_range ranges[PKVM_P2P_MAX_RANGES];
+	u16 range_count;
+};
+#endif
+
 struct dmar_domain {
 #ifndef __PKVM_HYP__
 	int	nid;			/* node id */
@@ -769,6 +791,7 @@ struct dmar_domain {
 
 	/* PKVM: VM handle that this domain is associated with (vm_handle < 0 indicates unassigned to any VM) */
 	int vm_handle;
+	struct pkvm_p2p_contract *p2p_contract;
 	/* PKVM: BDFs of devices that have pasid_setup_sl but not yet attach_ptdev */
 #define MAX_PENDING_BDFS	8
 	u16 pending_bdfs[MAX_PENDING_BDFS];

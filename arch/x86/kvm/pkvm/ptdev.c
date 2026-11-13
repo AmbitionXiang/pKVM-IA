@@ -364,6 +364,8 @@ static void pkvm_remove_vm_mmio_allowlist(struct pkvm_vm *vm, u16 bdf)
 	u16 src, dst = 0, old_count;
 
 	pkvm_spin_lock(&vm->lock);
+	/* No P2P map may observe the old allowlist after this unmap. */
+	pkvm_iommu_unmap_p2p(vm);
 	old_count = vm->mmio_allow_nr_ranges;
 	for (src = 0; src < old_count; src++) {
 		if (vm->mmio_allow_owner_bdf[src] == bdf)

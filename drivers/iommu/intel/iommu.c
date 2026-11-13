@@ -1827,9 +1827,9 @@ static void switch_to_super_page(struct dmar_domain *domain,
 				      end_pfn << VTD_PAGE_SHIFT, 0);
 }
 
-int domain_map(struct dmar_domain *domain, unsigned long iov_pfn,
+static int __domain_map(struct dmar_domain *domain, unsigned long iov_pfn,
 	       unsigned long phys_pfn, unsigned long nr_pages, int prot,
-	       gfp_t gfp)
+	       gfp_t gfp, bool peer)
 {
 	struct dma_pte *first_pte = NULL, *pte = NULL;
 	unsigned int largepage_lvl = 0;
@@ -1837,6 +1837,9 @@ int domain_map(struct dmar_domain *domain, unsigned long iov_pfn,
 	phys_addr_t pteval;
 	u64 attr;
 	int ret = 0;
+#ifndef __PKVM_HYP__
+	(void)peer;
+#endif
 #ifdef __PKVM_HYP__
 	unsigned long flush_iov_pfn = iov_pfn;
 	unsigned long flush_nr_pages = nr_pages;
@@ -1856,7 +1859,8 @@ int domain_map(struct dmar_domain *domain, unsigned long iov_pfn,
 #endif
 
 #ifdef __PKVM_HYP__
-	ret = pkvm_host_use_dma(phys_pfn << VTD_PAGE_SHIFT, nr_pages * VTD_PAGE_SIZE);
+	ret = pkvm_host_use_dma(phys_pfn << VTD_PAGE_SHIFT,
+				nr_pages * VTD_PAGE_SIZE);
 	if (ret)
 		return ret;
 #endif
@@ -1916,16 +1920,19 @@ int domain_map(struct dmar_domain *domain, unsigned long iov_pfn,
 		tmp = 0ULL;
 		if (!try_cmpxchg64_local(&pte->val, &tmp, pteval)) {
 #ifdef __PKVM_HYP__
-			struct dma_pte unused_pte = {
-				.val = pteval,
-			};
+			struct dma_pte unused_pte = { .val = pteval };
 
 			/*
 			 * Either the pte is mapped with a different value or
 			 * the same value, should unpin the previous pinned
 			 * memory pages.
 			 */
-			pkvm_host_unuse_dma(dma_pte_addr(&unused_pte), lvl_pages * VTD_PAGE_SIZE);
+			if (peer) {
+				ret = -EEXIST;
+				goto out;
+			}
+			pkvm_host_unuse_dma(dma_pte_addr(&unused_pte),
+					    lvl_pages * VTD_PAGE_SIZE);
 #endif
 #ifndef __PKVM_HYP__
 			static int dumps = 5;
@@ -1967,7 +1974,10 @@ int domain_map(struct dmar_domain *domain, unsigned long iov_pfn,
 
 out:
 #ifdef __PKVM_HYP__
-	if (domain->iotlb_sync_map) {
+	/* Early conflict exits bypass the normal end-of-batch writeback. */
+	if (pte && !IS_ERR(pte) && pte != first_pte)
+		domain_flush_cache(domain, first_pte, (void *)pte - (void *)first_pte);
+	if (domain->iotlb_sync_map && flush_nr_pages != nr_pages) {
 		flush_nr_pages -= nr_pages;
 		cache_tag_flush_range_np(domain, flush_iov_pfn << VTD_PAGE_SHIFT,
 					 (flush_iov_pfn + flush_nr_pages - 1) << VTD_PAGE_SHIFT);
@@ -1980,7 +1990,44 @@ out:
 	return ret;
 }
 
+int domain_map(struct dmar_domain *domain, unsigned long iov_pfn,
+	       unsigned long phys_pfn, unsigned long nr_pages, int prot, gfp_t gfp)
+{
+	return __domain_map(domain, iov_pfn, phys_pfn, nr_pages, prot, gfp, false);
+}
+
 #ifdef __PKVM_HYP__
+/* Caller holds domain->lock; checking does not allocate page-table pages. */
+int pkvm_domain_range_empty(struct dmar_domain *domain, unsigned long pfn,
+			    unsigned long pages)
+{
+	unsigned long end = pfn + pages;
+
+	if (!pages || end < pfn || !domain_pfn_supported(domain, end - 1))
+		return -EINVAL;
+	while (pfn < end) {
+		struct dma_pte *pte;
+		int large_page = 1;
+
+		pte = dma_pfn_level_pte(domain, pfn, 1, &large_page);
+		if (pte && READ_ONCE(pte->val))
+			return -EEXIST;
+		if (level_size(large_page) > end - pfn)
+			pfn = end;
+		else
+			pfn += level_size(large_page);
+	}
+	return 0;
+}
+
+/* Only the validated VM BAR contract may bypass ordinary Host DMA checks. */
+int pkvm_domain_map_peer(struct dmar_domain *domain, unsigned long iov_pfn,
+			 unsigned long phys_pfn, unsigned long pages)
+{
+	return __domain_map(domain, iov_pfn, phys_pfn, pages,
+			    DMA_PTE_READ | DMA_PTE_WRITE, 0, true);
+}
+
 static bool pasid_table_has_present_entries(struct pasid_dir_entry *dir, int max_pde)
 {
 	int i;

@@ -184,6 +184,7 @@ static int pkvm_vm_init(phys_addr_t host_kvm_pa, phys_addr_t pkvm_vm_pa,
 
 	pkvm_spin_lock_init(&pkvm_vm->lock);
 	INIT_LIST_HEAD(&pkvm_vm->ptdev_head);
+	pkvm_vm->p2p_contract = NULL;
 
 	ret = pkvm_guest_mmu_init(pkvm_vm, pgd_pa);
 	if (ret)
@@ -461,6 +462,15 @@ static int pkvm_vm_finalize(int vm_handle)
 		 vm_handle, kvm->arch.pkvm.finalized, shared_kvm->arch.pkvm.finalized);
 unlock:
 	pkvm_spin_unlock(&pkvm_vm->lock);
+#ifdef CONFIG_PKVM_INTEL
+	if (!ret) {
+		int p2p_ret = pkvm_iommu_map_p2p(vm_handle);
+
+		if (p2p_ret)
+			pkvm_err("pkvm: P2P BAR mapping disabled vm_handle=%d ret=%d\n",
+				 vm_handle, p2p_ret);
+	}
+#endif
 put_pkvm_vm:
 	pkvm_put_vm(pkvm_vm);
 	if (ret)

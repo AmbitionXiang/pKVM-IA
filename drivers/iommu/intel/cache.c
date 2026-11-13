@@ -49,6 +49,12 @@ static bool cache_tage_match(struct cache_tag *tag, u16 domain_id,
 	if (tag->domain_id != domain_id || tag->pasid != pasid)
 		return false;
 
+#ifdef __PKVM_HYP__
+	/* Keep each source RID identifiable, including for IOTLB tags. */
+	if (tag->bus != dev->info->bus || tag->devfn != dev->info->devfn)
+		return false;
+#endif
+
 	if (type == CACHE_TAG_IOTLB || type == CACHE_TAG_NESTING_IOTLB)
 		return tag->iommu == iommu;
 
@@ -93,6 +99,10 @@ int cache_tag_assign(struct dmar_domain *domain, u16 did, struct pkvm_device *de
 	tag->domain_id = did;
 	tag->pasid = pasid;
 	tag->users = 1;
+#ifdef __PKVM_HYP__
+	tag->bus = info->bus;
+	tag->devfn = info->devfn;
+#endif
 
 	if (type == CACHE_TAG_DEVTLB || type == CACHE_TAG_NESTING_DEVTLB) {
 #ifndef __PKVM_HYP__
@@ -126,6 +136,14 @@ int cache_tag_assign(struct dmar_domain *domain, u16 did, struct pkvm_device *de
 		if (temp->iommu == iommu)
 			prev = &temp->node;
 	}
+#ifdef __PKVM_HYP__
+	/* A published P2P contract authorizes only the collected bindings. */
+	if (type == CACHE_TAG_IOTLB && domain->p2p_contract) {
+		spin_unlock_irqrestore(&domain->cache_lock, flags);
+		pkvm_free_cache_tag(tag);
+		return -EBUSY;
+	}
+#endif
 	/*
 	 * Link cache tags of same iommu unit together, so corresponding
 	 * flush ops can be batched for iommu unit.

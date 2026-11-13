@@ -30,6 +30,7 @@ struct qi_desc;
 struct intel_iommu;
 struct dmar_domain;
 struct device_domain_info;
+struct pkvm_vm;
 struct irte;
 
 #ifdef CONFIG_PKVM_INTEL
@@ -178,6 +179,13 @@ static inline bool is_iommu_mmio(unsigned long phys)
 
 extern struct dmar_domain pt_domain;
 void init_pt_domain(void);
+
+int pkvm_iommu_map_p2p(int vm_handle);
+void pkvm_iommu_unmap_p2p(struct pkvm_vm *vm);
+int pkvm_domain_range_empty(struct dmar_domain *domain, unsigned long pfn,
+			    unsigned long pages);
+int pkvm_domain_map_peer(struct dmar_domain *domain, unsigned long iov_pfn,
+			 unsigned long phys_pfn, unsigned long pages);
 
 bool overlaps_iommu_mmio(unsigned long phys, unsigned long size);
 bool is_dev_in_satc(u16 bdf);
