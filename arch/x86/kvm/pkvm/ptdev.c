@@ -361,6 +361,8 @@ static void pkvm_remove_vm_mmio_allowlist(struct pkvm_vm *vm, u16 bdf)
 	u16 src, dst = 0, old_count;
 
 	pkvm_spin_lock(&vm->lock);
+	/* No P2P map may observe the old allowlist after this unmap. */
+	pkvm_iommu_unmap_p2p(vm);
 	old_count = vm->mmio_allow_nr_ranges;
 	for (src = 0; src < old_count; src++) {
 		if (vm->mmio_allow_owner_bdf[src] == bdf)
@@ -449,6 +451,8 @@ void pkvm_put_ptdev(struct pkvm_ptdev *ptdev)
 void pkvm_vm_link_ptdev(struct pkvm_vm *vm, struct list_head *node)
 {
 	pkvm_spin_lock(&vm->lock);
+	/* Binding authorization may read this list under an IOMMU lock. */
+	pkvm_iommu_unmap_p2p(vm);
 	list_add_tail(node, &vm->ptdev_head);
 	pkvm_spin_unlock(&vm->lock);
 }
@@ -484,6 +488,8 @@ int pkvm_detach_ptdev(struct pkvm_ptdev *ptdev, struct pkvm_vm *vm)
 
 	/* Drop the guest identity before the device can be assigned again. */
 	pkvm_spin_lock(&vm->lock);
+	/* A source device need not have published BAR ranges of its own. */
+	pkvm_iommu_unmap_p2p(vm);
 	ptdev->guest_pci_id_valid = false;
 	ptdev->guest_segment = 0;
 	ptdev->guest_bdf = 0;

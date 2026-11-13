@@ -7,7 +7,9 @@
 #include "pkvm/memory.h"
 #include "pkvm/pkvm.h"
 #include "pkvm/debug.h"
+#include "pkvm/ptdev.h"
 #include "iommu.h"
+#include "pasid.h"
 
 /*
  * IOMMU supported page size and page levels for second stage page table.
@@ -45,6 +47,114 @@ int nr_satc_devs;
 #define PKVM_MAX_IOMMU_NUM	16
 static struct intel_iommu iommus[PKVM_MAX_IOMMU_NUM];
 static int nr_iommus;
+
+/* P2P collection only: freeze table updates, in a fixed lock order. */
+void pkvm_iommu_lock_bindings(void)
+{
+	int i;
+
+	for (i = 0; i < nr_iommus; i++)
+		pkvm_spin_lock(&iommus[i].lock);
+}
+
+void pkvm_iommu_unlock_bindings(void)
+{
+	int i;
+
+	for (i = nr_iommus; i > 0; i--)
+		pkvm_spin_unlock(&iommus[i - 1].lock);
+}
+
+/* Caller holds iommu->lock. Inspect tables without allocating any entries. */
+static int pkvm_p2p_context_uses_domain(struct intel_iommu *iommu,
+				      struct context_entry *context,
+				      struct dmar_domain *domain)
+{
+	u64 pgd = __pkvm_pa(domain->pgd);
+	struct pasid_dir_entry *dir;
+	unsigned int d, p;
+	int used = 0;
+
+	if (!sm_supported(iommu)) {
+		if ((context->lo & VTD_PAGE_MASK) != pgd)
+			return 0;
+		if (domain->use_first_level)
+			return -EPERM;
+		return 1;
+	}
+
+	dir = __pkvm_va(context->lo & VTD_PAGE_MASK);
+	for (d = 0; d < get_pasid_dir_size(context); d++) {
+		struct pasid_entry *entries = get_pasid_table_from_pde(&dir[d]);
+
+		if (!entries)
+			continue;
+		for (p = 0; p < PASID_TBL_ENTRIES; p++) {
+			struct pasid_entry *entry = &entries[p];
+			u64 root;
+			u16 type;
+
+			if (!pasid_pte_is_present(entry))
+				continue;
+			type = pasid_pte_get_pgtt(entry);
+			if (type == PASID_ENTRY_PGTT_FL_ONLY)
+				root = pasid_get_flptr(entry);
+			else if (type == PASID_ENTRY_PGTT_SL_ONLY)
+				root = pasid_get_slptr(entry);
+			else
+				return -EOPNOTSUPP;
+			if (root != pgd)
+				continue;
+			if (domain->use_first_level !=
+			    (type == PASID_ENTRY_PGTT_FL_ONLY))
+				return -EPERM;
+			used = 1;
+		}
+	}
+	return used;
+}
+
+/* Caller holds vm->lock and every IOMMU lock through contract publication. */
+int pkvm_iommu_p2p_domain_is_used(struct pkvm_vm *vm, struct dmar_domain *domain)
+{
+	struct pkvm_ptdev *ptdev;
+	unsigned int bus, devfn;
+	int i, used = 0;
+
+	for (i = 0; i < nr_iommus; i++) {
+		struct intel_iommu *iommu = &iommus[i];
+
+		if (!iommu->root_entry)
+			continue;
+		for (bus = 0; bus < 256; bus++) {
+			for (devfn = 0; devfn < 256; devfn++) {
+				struct context_entry *context;
+				bool attached = false;
+				int ret;
+
+				context = iommu_context_addr(iommu, bus, devfn, 0);
+				if (!context || !context_present(context))
+					continue;
+				ret = pkvm_p2p_context_uses_domain(iommu, context, domain);
+				if (ret < 0)
+					return ret;
+				if (!ret)
+					continue;
+				list_for_each_entry(ptdev, &vm->ptdev_head, vm_node) {
+					if (ptdev->bdf == PCI_DEVID(bus, devfn) &&
+					    ptdev->vm_handle == vm->kvm.arch.pkvm.handle) {
+						attached = true;
+						break;
+					}
+				}
+				if (!attached)
+					return -EPERM;
+				used = 1;
+			}
+		}
+	}
+	return used;
+}
 
 /*
  * Flag denoting if all IOMMUs in the system have page walk coherency support.
