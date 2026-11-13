@@ -76,6 +76,7 @@ struct pkvm_vm {
 #ifdef CONFIG_PKVM_INTEL
 	/* Linked list of passthrough devices assigned to this VM */
 	struct list_head ptdev_head;
+	struct pkvm_p2p_contract *p2p_contract;
 	/* MMIO allowlist for guest */
 	/* Protected by lock; prevents finalize during BAR publication. */
 	bool mmio_metadata_busy;
