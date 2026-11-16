@@ -503,8 +503,7 @@ int pkvm_iommu_attach_ptdev(struct pkvm_ptdev *ptdev, int vm_handle)
 		    domain->pending_devs[i].pasid != ptdev->pasid)
 			continue;
 		ret = 0;
-		if (domain->vm_handle == PKVM_DOMAIN_UNBOUND ||
-		    domain->vm_handle == PKVM_DOMAIN_HOST)
+		if (domain->vm_handle == PKVM_DOMAIN_UNBOUND)
 			domain->vm_handle = vm_handle;
 		else if (domain->vm_handle != vm_handle)
 			ret = -EPERM;
