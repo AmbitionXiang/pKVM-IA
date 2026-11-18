@@ -8,6 +8,7 @@
 #include "ptdev.h"
 #include "debug.h"
 #include "memory.h"
+#include "mmu.h"
 #include "pkvm_iommu.h"
 #include "vmx/ept.h"
 
@@ -573,14 +574,33 @@ err_restore:
 static int pkvm_restore_ptdev_bars_locked(struct pkvm_vm *vm,
 					  struct pkvm_ptdev *ptdev)
 {
+	u16 idx;
 	int ret;
 
-	ptdev->assignment_state = PKVM_PTDEV_RESTORING;
+	WRITE_ONCE(ptdev->assignment_state, PKVM_PTDEV_RESTORING);
 	pkvm_withdraw_ptdev_mmio_contract_locked(vm, ptdev);
 
 	ret = pkvm_iommu_pause_dev_dma(ptdev);
 	if (ret)
 		return ret;
+
+	/* Revoke guest CPU access before returning any BAR range to the host. */
+	for (idx = 0; idx < ptdev->mmio_metadata.nr_ranges; idx++) {
+		const struct kvm_protected_vm_ptdev_mmio_range *range =
+			&ptdev->mmio_metadata.ranges[idx];
+		u64 hpa;
+
+		ret = pkvm_ptdev_range_hpa_locked(ptdev, range, &hpa);
+		if (ret)
+			return ret;
+		/* MMU helpers also set current_vm for page-table callbacks. */
+		pkvm_guest_mmu_lock(vm);
+		ret = pkvm_pgtable_unmap(&vm->mmu, range->guest_gpa, hpa,
+					 range->size);
+		pkvm_guest_mmu_unlock(vm);
+		if (ret)
+			return ret;
+	}
 
 	ret = pkvm_restore_ptdev_mmio_ranges_locked(ptdev);
 	if (ret)
@@ -639,29 +659,6 @@ int pkvm_attach_ptdev(u16 bdf, struct pkvm_vm *vm)
 	return 0;
 }
 
-/* Caller holds vm->lock to keep the registered mapping list stable. */
-static void pkvm_dump_ptdev_pci_ids_locked(struct pkvm_vm *vm)
-{
-	struct pkvm_ptdev *ptdev;
-	int vm_handle = vm->kvm.arch.pkvm.handle;
-	unsigned int count = 0;
-
-	pkvm_info("ptdev-pci-id: vm=%d dev-list begin\n", vm_handle);
-	list_for_each_entry(ptdev, &vm->ptdev_head, vm_node) {
-		if (!ptdev->guest_pci_id_valid)
-			continue;
-
-		pkvm_info("ptdev-pci-id: vm=%d entry=%u host=0000:%02x:%02x.%x guest=%04x:%02x:%02x.%x\n",
-			  vm_handle, count++, ptdev->bdf >> 8,
-			  (ptdev->bdf >> 3) & 0x1f, ptdev->bdf & 0x7,
-			  ptdev->guest_segment, ptdev->guest_bdf >> 8,
-			  (ptdev->guest_bdf >> 3) & 0x1f,
-			  ptdev->guest_bdf & 0x7);
-	}
-	pkvm_info("ptdev-pci-id: vm=%d dev-list end entries=%u\n",
-		  vm_handle, count);
-}
-
 int pkvm_register_ptdev_pci_id(struct pkvm_vm *vm, u64 host_id, u64 guest_id)
 {
 	struct pkvm_ptdev *ptdev, *other;
@@ -710,8 +707,6 @@ int pkvm_register_ptdev_pci_id(struct pkvm_vm *vm, u64 host_id, u64 guest_id)
 	ptdev->guest_bdf = guest_bdf;
 	ptdev->guest_pci_id_valid = true;
 out:
-	if (!ret)
-		pkvm_dump_ptdev_pci_ids_locked(vm);
 	pkvm_spin_unlock(&vm->lock);
 	pkvm_spin_unlock(&ptdev->lock);
 	pkvm_put_ptdev(ptdev);

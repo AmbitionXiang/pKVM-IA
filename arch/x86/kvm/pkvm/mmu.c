@@ -432,13 +432,13 @@ static const struct pkvm_pgtable_mm_ops guest_mmu_mm_ops = {
 	.page_count = guest_mmu_page_count,
 };
 
-static void pkvm_guest_mmu_lock(struct pkvm_vm *vm)
+void pkvm_guest_mmu_lock(struct pkvm_vm *vm)
 {
 	pkvm_spin_lock(&vm->mmu_lock);
 	current_vm = vm;
 }
 
-static void pkvm_guest_mmu_unlock(struct pkvm_vm *vm)
+void pkvm_guest_mmu_unlock(struct pkvm_vm *vm)
 {
 	current_vm = NULL;
 	pkvm_spin_unlock(&vm->mmu_lock);
@@ -1430,6 +1430,14 @@ int pkvm_host_map_guest_mmio(struct kvm_vcpu *vcpu, unsigned long gpa,
 		return -EPERM;
 
 	pkvm_guest_mmu_lock(pkvm_vm);
+
+#ifdef CONFIG_PKVM_INTEL
+	/* Recheck under the same lock used to revoke BAR mappings on detach. */
+	if (!pkvm_vm_hpa_hits_attached_boot_ptdev_bar(vcpu->kvm, hpa, size)) {
+		ret = -EPERM;
+		goto unlock;
+	}
+#endif
 
 	ret = check_page_state(&pkvm_vm->mmu, gpa, size, PKVM_PAGE_NONE);
 	if (ret)

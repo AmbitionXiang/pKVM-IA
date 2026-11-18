@@ -526,14 +526,36 @@ static int remove_device_from_pkvm(struct device *dev, void *data)
 
 	/* Serialize detach and cache removal with metadata submission. */
 	mutex_lock(&pkvm->finalized_lock);
+	/* Keep the hyp teardown and host mapping records atomic to page faults. */
+	write_lock(&kvm->mmu_lock);
 	ret = pkvm_hypercall(remove_ptdev, pkvm->handle, devid);
-	if (!ret && pkvm->ptdev_mmio_metadata_valid &&
+	if (pkvm->ptdev_mmio_metadata_valid &&
 	    pkvm->ptdev_mmio_metadata.segment == pci_domain_nr(pdev->bus) &&
 	    pkvm->ptdev_mmio_metadata.bdf == devid) {
-		memset(&pkvm->ptdev_mmio_metadata, 0,
-		       sizeof(pkvm->ptdev_mmio_metadata));
-		pkvm->ptdev_mmio_metadata_valid = false;
+		u16 idx;
+
+		/* A failed detach may already have revoked some BAR mappings. */
+		for (idx = 0; idx < pkvm->ptdev_mmio_metadata.nr_ranges; idx++) {
+			const struct kvm_protected_vm_ptdev_mmio_range *range =
+				&pkvm->ptdev_mmio_metadata.ranges[idx];
+			gfn_t start = range->guest_gpa >> PAGE_SHIFT;
+			gfn_t end = start + (range->size >> PAGE_SHIFT);
+			struct pkvm_mapping *mapping;
+
+			for_each_pkvm_mapping(kvm, start, end, mapping) {
+				if (mapping->pinned_page)
+					continue;
+				pkvm_mapping_remove(mapping, &pkvm->mappings);
+				kfree(mapping);
+			}
+		}
+		if (!ret) {
+			memset(&pkvm->ptdev_mmio_metadata, 0,
+			       sizeof(pkvm->ptdev_mmio_metadata));
+			pkvm->ptdev_mmio_metadata_valid = false;
+		}
 	}
+	write_unlock(&kvm->mmu_lock);
 	mutex_unlock(&pkvm->finalized_lock);
 
 	return ret;
