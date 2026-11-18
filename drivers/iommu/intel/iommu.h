@@ -665,6 +665,26 @@ struct pkvm_pending_ptdev {
 	u32 pasid;
 	u16 bdf;
 };
+
+struct pkvm_vm;
+struct dmar_domain;
+#define PKVM_P2P_MAX_DOMAINS	64
+#define PKVM_P2P_MAX_RANGES	64
+
+struct pkvm_p2p_range {
+	u64 iova;
+	u64 hpa;
+	u64 size;
+	u16 owner_bdf;
+};
+
+struct pkvm_p2p_contract {
+	struct pkvm_vm *vm;
+	struct dmar_domain *domains[PKVM_P2P_MAX_DOMAINS];
+	u16 domain_count;
+	struct pkvm_p2p_range ranges[PKVM_P2P_MAX_RANGES];
+	u16 range_count;
+};
 #endif
 
 struct dmar_domain {
@@ -780,6 +800,8 @@ struct dmar_domain {
 
 	/* PKVM: VM handle that this domain is associated with (vm_handle < 0 indicates unassigned to any VM) */
 	int vm_handle;
+	/* Binding readers hold one IOMMU lock; publication/clear holds all. */
+	struct pkvm_p2p_contract *p2p_contract;
 	/* PKVM: BDFs of devices that have pasid_setup_sl but not yet attach_ptdev */
 #define MAX_PENDING_BDFS	8
 	struct pkvm_pending_ptdev pending_devs[MAX_PENDING_BDFS];

@@ -622,6 +622,12 @@ int intel_pasid_setup_first_level(struct intel_iommu *iommu,
 	}
 
 #ifdef __PKVM_HYP__
+	ret = pkvm_iommu_p2p_check_binding(domain,
+			PCI_DEVID(dev->info->bus, dev->info->devfn));
+	if (ret) {
+		spin_unlock(&iommu->lock);
+		return ret;
+	}
 	ret = cache_tag_assign_domain(domain, did, dev, pasid);
 	if (ret) {
 		spin_unlock(&iommu->lock);
@@ -729,6 +735,12 @@ int intel_pasid_setup_second_level(struct intel_iommu *iommu,
 	}
 
 #ifdef __PKVM_HYP__
+	ret = pkvm_iommu_p2p_check_binding(domain,
+			PCI_DEVID(dev->info->bus, dev->info->devfn));
+	if (ret) {
+		spin_unlock(&iommu->lock);
+		return ret;
+	}
 	ret = cache_tag_assign_domain(domain, did, dev, pasid);
 	if (ret) {
 		spin_unlock(&iommu->lock);
