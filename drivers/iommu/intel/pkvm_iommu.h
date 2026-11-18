@@ -214,7 +214,8 @@ int pkvm_iommu_domain_map(struct domain_map_data *in, struct domain_map_data *ou
 int pkvm_iommu_domain_unmap(u64 pgd_gpa, u64 start_pfn, u64 last_pfn);
 int pkvm_iommu_modify_irte(struct modify_irte_data *data);
 
-int pkvm_iommu_attach_ptdev(struct pkvm_ptdev *ptdev, int vm_handle);
+/* Caller holds ptdev->lock. */
+int pkvm_iommu_attach_ptdev_locked(struct pkvm_ptdev *ptdev, int vm_handle);
 bool pkvm_iommu_vm_domains_ready(int vm_handle);
 bool pkvm_iommu_vm_dma_ready(int vm_handle, struct dmar_domain *mapping_domain);
 /* Caller holds ptdev->lock for pause/resume. */

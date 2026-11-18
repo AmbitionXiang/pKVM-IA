@@ -107,8 +107,6 @@ bool pkvm_host_hpa_hits_boot_ptdev_bar(u64 hpa, u64 size);
 bool pkvm_vm_hpa_hits_attached_boot_ptdev_bar(struct kvm *kvm, u64 hpa, u64 size);
 bool pkvm_is_boot_ptdev(u16 bdf);
 
-void pkvm_vm_link_ptdev(struct pkvm_vm *vm, struct list_head *node);
-void pkvm_vm_unlink_ptdev(struct pkvm_vm *vm, struct list_head *node);
 
 static inline bool match_ptdev(struct pkvm_ptdev *ptdev, u16 bdf)
 {

@@ -395,24 +395,8 @@ void pkvm_put_ptdev(struct pkvm_ptdev *ptdev)
 	pkvm_spin_unlock(&ptdev_lock);
 }
 
-void pkvm_vm_link_ptdev(struct pkvm_vm *vm, struct list_head *node)
-{
-	pkvm_spin_lock(&vm->lock);
-	list_add_tail(node, &vm->ptdev_head);
-	pkvm_spin_unlock(&vm->lock);
-}
-
-void pkvm_vm_unlink_ptdev(struct pkvm_vm *vm, struct list_head *node)
-{
-	pkvm_spin_lock(&vm->lock);
-	list_del(node);
-	pkvm_spin_unlock(&vm->lock);
-}
-
 static int pkvm_restore_ptdev_bars_locked(struct pkvm_vm *vm,
 					  struct pkvm_ptdev *ptdev);
-static int pkvm_publish_ptdev_mmio_contract_locked(struct pkvm_vm *vm,
-						   struct pkvm_ptdev *ptdev);
 static void pkvm_withdraw_ptdev_mmio_contract_locked(struct pkvm_vm *vm,
 						     struct pkvm_ptdev *ptdev);
 
@@ -421,32 +405,35 @@ int pkvm_detach_ptdev(struct pkvm_ptdev *ptdev, struct pkvm_vm *vm)
 {
 	int ret;
 
-	/* Reset what the attach API has set */
 	pkvm_spin_lock(&ptdev->lock);
+	if (ptdev->vm_handle != vm->kvm.arch.pkvm.handle) {
+		ret = -ENODEV;
+		goto out_unlock;
+	}
+
 	ret = pkvm_restore_ptdev_bars_locked(vm, ptdev);
 	if (ret) {
 		pkvm_err("pkvm: detach ptdev restore failed bdf=0x%x ret=%d\n",
 			 ptdev->bdf, ret);
-		pkvm_spin_unlock(&ptdev->lock);
-		return ret;
+		goto out_unlock;
 	}
 
-	/* Drop the guest identity before the device can be assigned again. */
 	pkvm_spin_lock(&vm->lock);
+	list_del(&ptdev->vm_node);
 	ptdev->guest_pci_id_valid = false;
 	ptdev->guest_segment = 0;
 	ptdev->guest_bdf = 0;
-	ptdev->vm_handle = PKVM_PTDEV_VM_UNBOUND;
-	pkvm_spin_unlock(&vm->lock);
 	ptdev->mmio_metadata_valid = false;
 	ptdev->guest_contract_published = false;
 	memset(&ptdev->mmio_metadata, 0, sizeof(ptdev->mmio_metadata));
+	ptdev->vm_handle = PKVM_PTDEV_VM_UNBOUND;
+	pkvm_spin_unlock(&vm->lock);
+
+out_unlock:
 	pkvm_spin_unlock(&ptdev->lock);
-
-	pkvm_vm_unlink_ptdev(vm, &ptdev->vm_node);
-
-	pkvm_put_ptdev(ptdev);
-	return 0;
+	if (!ret)
+		pkvm_put_ptdev(ptdev);
+	return ret;
 }
 
 static u64 pkvm_host_ept_mmio_prot(void)
@@ -627,36 +614,32 @@ int pkvm_attach_ptdev(u16 bdf, struct pkvm_vm *vm)
 	pkvm_spin_lock(&ptdev->lock);
 
 	vm_handle = vm->kvm.arch.pkvm.handle;
-	if (cmpxchg(&ptdev->vm_handle, PKVM_PTDEV_VM_UNBOUND, vm_handle) != PKVM_PTDEV_VM_UNBOUND) {
+	if (ptdev->vm_handle != PKVM_PTDEV_VM_UNBOUND) {
 		pkvm_err("%s: ptdev with bdf 0x%x is already attached\n",
 			 __func__, bdf);
-		pkvm_spin_unlock(&ptdev->lock);
-		pkvm_put_ptdev(ptdev);
-		return -ENODEV;
+		ret = -ENODEV;
+		goto out_put;
 	}
 
-	pkvm_spin_unlock(&ptdev->lock);
-
-	ret = pkvm_iommu_attach_ptdev(ptdev, vm_handle);
+	ret = pkvm_iommu_attach_ptdev_locked(ptdev, vm_handle);
 	if (ret) {
-		pkvm_err("%s: pkvm_iommu_attach_ptdev failed bdf=0x%x ret=%d\n",
+		pkvm_err("%s: pkvm_iommu_attach_ptdev_locked failed bdf=0x%x ret=%d\n",
 			 __func__, bdf, ret);
-		pkvm_detach_ptdev(ptdev, vm);
-		return ret;
+		goto out_put;
 	}
 
-	pkvm_vm_link_ptdev(vm, &ptdev->vm_node);
-
-	pkvm_spin_lock(&ptdev->lock);
+	pkvm_spin_lock(&vm->lock);
+	ptdev->vm_handle = vm_handle;
 	ptdev->assignment_state = PKVM_PTDEV_ATTACHING;
-	ret = pkvm_publish_ptdev_mmio_contract_locked(vm, ptdev);
+	list_add_tail(&ptdev->vm_node, &vm->ptdev_head);
+	pkvm_spin_unlock(&vm->lock);
 	pkvm_spin_unlock(&ptdev->lock);
-	if (ret) {
-		pkvm_detach_ptdev(ptdev, vm);
-		return ret;
-	}
-
 	return 0;
+
+out_put:
+	pkvm_spin_unlock(&ptdev->lock);
+	pkvm_put_ptdev(ptdev);
+	return ret;
 }
 
 int pkvm_register_ptdev_pci_id(struct pkvm_vm *vm, u64 host_id, u64 guest_id)
@@ -716,22 +699,11 @@ out:
 int pkvm_remove_ptdev(u16 bdf, struct pkvm_vm *vm)
 {
 	struct pkvm_ptdev *ptdev;
-	int vm_handle;
 	int ret;
 
 	ptdev = pkvm_get_ptdev(bdf);
 	if (!ptdev)
 		return -ENODEV;
-
-	vm_handle = vm->kvm.arch.pkvm.handle;
-
-	pkvm_spin_lock(&ptdev->lock);
-	if (ptdev->vm_handle != vm_handle) {
-		pkvm_spin_unlock(&ptdev->lock);
-		pkvm_put_ptdev(ptdev);
-		return -ENODEV;
-	}
-	pkvm_spin_unlock(&ptdev->lock);
 
 	ret = pkvm_detach_ptdev(ptdev, vm);
 	/* Drop the lookup reference, even if detach failed. */
@@ -751,15 +723,6 @@ void pkvm_vm_destroy_ptdevs(struct pkvm_vm *vm)
 			continue;
 		}
 		pkvm_spin_unlock(&vm->lock);
-
-		pkvm_spin_lock(&ptdev->lock);
-		if (ptdev->vm_handle != vm->kvm.arch.pkvm.handle) {
-			pkvm_spin_unlock(&ptdev->lock);
-			pkvm_put_ptdev(ptdev);
-			pkvm_spin_lock(&vm->lock);
-			continue;
-		}
-		pkvm_spin_unlock(&ptdev->lock);
 
 		pkvm_detach_ptdev(ptdev, vm);
 		pkvm_put_ptdev(ptdev);

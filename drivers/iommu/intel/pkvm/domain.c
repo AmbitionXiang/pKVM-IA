@@ -501,15 +501,14 @@ int pkvm_iommu_pause_dev_dma(struct pkvm_ptdev *ptdev)
 	return ret;
 }
 
-int pkvm_iommu_attach_ptdev(struct pkvm_ptdev *ptdev, int vm_handle)
+/* Caller holds ptdev->lock. */
+int pkvm_iommu_attach_ptdev_locked(struct pkvm_ptdev *ptdev, int vm_handle)
 {
-	struct dmar_domain *domain;
+	struct dmar_domain *domain = ptdev->dma_domain;
 	int i, ret = -ENODEV;
 
-	pkvm_spin_lock(&ptdev->lock);
-	domain = ptdev->dma_domain;
 	if (!domain)
-		goto out;
+		return ret;
 	pkvm_spin_lock(&domain->lock);
 	for (i = 0; i < domain->pending_count; i++) {
 		if (domain->pending_devs[i].bdf != ptdev->bdf ||
@@ -524,8 +523,6 @@ int pkvm_iommu_attach_ptdev(struct pkvm_ptdev *ptdev, int vm_handle)
 	}
 	/* Keep pending records until the outer attach has succeeded. */
 	pkvm_spin_unlock(&domain->lock);
-out:
-	pkvm_spin_unlock(&ptdev->lock);
 	return ret;
 }
 
