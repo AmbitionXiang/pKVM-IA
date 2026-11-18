@@ -101,7 +101,9 @@ int pkvm_guest_share_host(struct kvm_vcpu *vcpu, unsigned long gpa,
 			  unsigned long size, unsigned long *need_mc_pages);
 int pkvm_guest_unshare_host(struct kvm_vcpu *vcpu, unsigned long gpa,
 			    unsigned long size, unsigned long *need_mc_pages);
-int pkvm_host_use_dma(unsigned long phys, unsigned long size);
+struct dmar_domain;
+int pkvm_host_use_dma(unsigned long phys, unsigned long size,
+		      struct dmar_domain *domain);
 void pkvm_host_unuse_dma(unsigned long phys, unsigned long size);
 
 #endif /* __PKVM_X86_MEM_PROTECT_H */

@@ -402,11 +402,8 @@ static int pkvm_vm_ioctl_set_ptdev_mmio_metadata(
 	if (ret)
 		return ret;
 
+	/* Also serializes metadata submission with successful device removal. */
 	mutex_lock(&pkvm->finalized_lock);
-	if (pkvm->finalized) {
-		ret = -EBUSY;
-		goto out;
-	}
 
 	/* The hypervisor keeps immutable metadata per device, not per VM. */
 	pkvm->ptdev_mmio_metadata = kmeta;
@@ -440,11 +437,9 @@ static int pkvm_vm_ioctl_set_ptdev_pci_id(
 	guest_id = ((u32)id.guest_segment << 16) | id.guest_bdf;
 
 	mutex_lock(&pkvm->finalized_lock);
-	if (pkvm->finalized)
-		ret = -EBUSY;
-	else
-		ret = pkvm_hypercall(register_ptdev_pci_id, pkvm->handle,
-				    host_id, guest_id);
+	/* pKVM gates first-time configuration on completed device attachment. */
+	ret = pkvm_hypercall(register_ptdev_pci_id, pkvm->handle,
+			     host_id, guest_id);
 	mutex_unlock(&pkvm->finalized_lock);
 
 	return ret;
@@ -498,8 +493,10 @@ int kvm_arch_add_device_to_pkvm(struct kvm *kvm, struct file *file)
 static int remove_device_from_pkvm(struct device *dev, void *data)
 {
 	struct kvm *kvm = data;
+	struct kvm_pkvm_vm *pkvm = &kvm->arch.pkvm;
 	struct pci_dev *pdev;
 	u16 devid;
+	int ret;
 
 	if (!dev_is_pci(dev))
 		return 0;
@@ -507,7 +504,41 @@ static int remove_device_from_pkvm(struct device *dev, void *data)
 	pdev = to_pci_dev(dev);
 	devid = PCI_DEVID(pdev->bus->number, pdev->devfn);
 
-	return pkvm_hypercall(remove_ptdev, kvm->arch.pkvm.handle, devid);
+	/* Serialize detach and cache removal with metadata submission. */
+	mutex_lock(&pkvm->finalized_lock);
+	/* Keep the hyp teardown and host mapping records atomic to page faults. */
+	write_lock(&kvm->mmu_lock);
+	ret = pkvm_hypercall(remove_ptdev, pkvm->handle, devid);
+	if (pkvm->ptdev_mmio_metadata_valid &&
+	    pkvm->ptdev_mmio_metadata.segment == pci_domain_nr(pdev->bus) &&
+	    pkvm->ptdev_mmio_metadata.bdf == devid) {
+		u16 idx;
+
+		/* A failed detach may already have revoked some BAR mappings. */
+		for (idx = 0; idx < pkvm->ptdev_mmio_metadata.nr_ranges; idx++) {
+			const struct kvm_protected_vm_ptdev_mmio_range *range =
+				&pkvm->ptdev_mmio_metadata.ranges[idx];
+			gfn_t start = range->guest_gpa >> PAGE_SHIFT;
+			gfn_t end = start + (range->size >> PAGE_SHIFT);
+			struct pkvm_mapping *mapping;
+
+			for_each_pkvm_mapping(kvm, start, end, mapping) {
+				if (mapping->pinned_page)
+					continue;
+				pkvm_mapping_remove(mapping, &pkvm->mappings);
+				kfree(mapping);
+			}
+		}
+		if (!ret) {
+			memset(&pkvm->ptdev_mmio_metadata, 0,
+			       sizeof(pkvm->ptdev_mmio_metadata));
+			pkvm->ptdev_mmio_metadata_valid = false;
+		}
+	}
+	write_unlock(&kvm->mmu_lock);
+	mutex_unlock(&pkvm->finalized_lock);
+
+	return ret;
 }
 
 int kvm_arch_remove_device_from_pkvm(struct kvm *kvm, struct file *file)

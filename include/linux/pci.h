@@ -1152,6 +1152,8 @@ int no_pci_devices(void);
 void pcibios_resource_survey_bus(struct pci_bus *bus);
 void pcibios_bus_add_device(struct pci_dev *pdev);
 void arch_pci_set_private_dma_allowed(struct pci_dev *pdev);
+int arch_pci_refresh_mmio_allowlist(struct pci_dev *pdev);
+void arch_pci_remove_mmio_allowlist(struct pci_dev *pdev);
 void pcibios_add_bus(struct pci_bus *bus);
 void pcibios_remove_bus(struct pci_bus *bus);
 void pcibios_fixup_bus(struct pci_bus *);

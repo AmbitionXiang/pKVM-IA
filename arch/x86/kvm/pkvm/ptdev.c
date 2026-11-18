@@ -8,6 +8,7 @@
 #include "ptdev.h"
 #include "debug.h"
 #include "memory.h"
+#include "mmu.h"
 #include "pkvm_iommu.h"
 #include "vmx/ept.h"
 
@@ -395,7 +396,7 @@ struct pkvm_ptdev *pkvm_get_ptdev(u16 bdf)
 	return ptdev;
 }
 
-static int __pkvm_get_or_create_ptdev(u16 bdf,
+int pkvm_get_or_create_ptdev(u16 bdf,
 				      struct pkvm_ptdev **ptdev)
 {
 	struct pkvm_ptdev *found;
@@ -466,8 +467,6 @@ void pkvm_vm_unlink_ptdev(struct pkvm_vm *vm, struct list_head *node)
 
 static int pkvm_restore_ptdev_bars_locked(struct pkvm_vm *vm,
 					  struct pkvm_ptdev *ptdev);
-static int pkvm_publish_ptdev_mmio_contract_locked(struct pkvm_vm *vm,
-						   struct pkvm_ptdev *ptdev);
 static void pkvm_withdraw_ptdev_mmio_contract_locked(struct pkvm_vm *vm,
 						     struct pkvm_ptdev *ptdev);
 
@@ -476,34 +475,37 @@ int pkvm_detach_ptdev(struct pkvm_ptdev *ptdev, struct pkvm_vm *vm)
 {
 	int ret;
 
-	/* Reset what the attach API has set */
 	pkvm_spin_lock(&ptdev->lock);
+	if (ptdev->vm_handle != vm->kvm.arch.pkvm.handle) {
+		ret = -ENODEV;
+		goto out_unlock;
+	}
+
 	ret = pkvm_restore_ptdev_bars_locked(vm, ptdev);
 	if (ret) {
 		pkvm_err("pkvm: detach ptdev restore failed bdf=0x%x ret=%d\n",
 			 ptdev->bdf, ret);
-		pkvm_spin_unlock(&ptdev->lock);
-		return ret;
+		goto out_unlock;
 	}
 
-	/* Drop the guest identity before the device can be assigned again. */
 	pkvm_spin_lock(&vm->lock);
+	list_del(&ptdev->vm_node);
 	/* A source device need not have published BAR ranges of its own. */
 	pkvm_iommu_unmap_p2p(vm);
 	ptdev->guest_pci_id_valid = false;
 	ptdev->guest_segment = 0;
 	ptdev->guest_bdf = 0;
-	ptdev->vm_handle = PKVM_PTDEV_VM_UNBOUND;
-	pkvm_spin_unlock(&vm->lock);
 	ptdev->mmio_metadata_valid = false;
 	ptdev->guest_contract_published = false;
 	memset(&ptdev->mmio_metadata, 0, sizeof(ptdev->mmio_metadata));
+	ptdev->vm_handle = PKVM_PTDEV_VM_UNBOUND;
+	pkvm_spin_unlock(&vm->lock);
+
+out_unlock:
 	pkvm_spin_unlock(&ptdev->lock);
-
-	pkvm_vm_unlink_ptdev(vm, &ptdev->vm_node);
-
-	pkvm_put_ptdev(ptdev);
-	return 0;
+	if (!ret)
+		pkvm_put_ptdev(ptdev);
+	return ret;
 }
 
 static u64 pkvm_host_ept_mmio_prot(void)
@@ -644,10 +646,33 @@ err_restore:
 static int pkvm_restore_ptdev_bars_locked(struct pkvm_vm *vm,
 					  struct pkvm_ptdev *ptdev)
 {
+	u16 idx;
 	int ret;
 
-	ptdev->assignment_state = PKVM_PTDEV_RESTORING;
+	WRITE_ONCE(ptdev->assignment_state, PKVM_PTDEV_RESTORING);
 	pkvm_withdraw_ptdev_mmio_contract_locked(vm, ptdev);
+
+	ret = pkvm_iommu_pause_dev_dma(ptdev);
+	if (ret)
+		return ret;
+
+	/* Revoke guest CPU access before returning any BAR range to the host. */
+	for (idx = 0; idx < ptdev->mmio_metadata.nr_ranges; idx++) {
+		const struct kvm_protected_vm_ptdev_mmio_range *range =
+			&ptdev->mmio_metadata.ranges[idx];
+		u64 hpa;
+
+		ret = pkvm_ptdev_range_hpa_locked(ptdev, range, &hpa);
+		if (ret)
+			return ret;
+		/* MMU helpers also set current_vm for page-table callbacks. */
+		pkvm_guest_mmu_lock(vm);
+		ret = pkvm_pgtable_unmap(&vm->mmu, range->guest_gpa, hpa,
+					 range->size);
+		pkvm_guest_mmu_unlock(vm);
+		if (ret)
+			return ret;
+	}
 
 	ret = pkvm_restore_ptdev_mmio_ranges_locked(ptdev);
 	if (ret)
@@ -664,7 +689,7 @@ int pkvm_attach_ptdev(u16 bdf, struct pkvm_vm *vm)
 	int vm_handle;
 	int ret;
 
-	ret = __pkvm_get_or_create_ptdev(bdf, &ptdev);
+	ret = pkvm_get_or_create_ptdev(bdf, &ptdev);
 	if (ret == -EPERM)
 		pkvm_err("%s: reject bdf 0x%x outside boot manifest\n",
 			 __func__, bdf);
@@ -674,60 +699,32 @@ int pkvm_attach_ptdev(u16 bdf, struct pkvm_vm *vm)
 	pkvm_spin_lock(&ptdev->lock);
 
 	vm_handle = vm->kvm.arch.pkvm.handle;
-	if (cmpxchg(&ptdev->vm_handle, PKVM_PTDEV_VM_UNBOUND, vm_handle) != PKVM_PTDEV_VM_UNBOUND) {
+	if (ptdev->vm_handle != PKVM_PTDEV_VM_UNBOUND) {
 		pkvm_err("%s: ptdev with bdf 0x%x is already attached\n",
 			 __func__, bdf);
-		pkvm_spin_unlock(&ptdev->lock);
-		pkvm_put_ptdev(ptdev);
-		return -ENODEV;
+		ret = -ENODEV;
+		goto out_put;
 	}
 
-	ptdev->assignment_state = PKVM_PTDEV_ATTACHING;
-
-	pkvm_spin_unlock(&ptdev->lock);
-
-	ret = pkvm_iommu_attach_ptdev(bdf, vm_handle);
+	ret = pkvm_iommu_attach_ptdev_locked(ptdev, vm_handle);
 	if (ret) {
-		pkvm_err("%s: pkvm_iommu_attach_ptdev failed bdf=0x%x ret=%d\n",
+		pkvm_err("%s: pkvm_iommu_attach_ptdev_locked failed bdf=0x%x ret=%d\n",
 			 __func__, bdf, ret);
-		pkvm_detach_ptdev(ptdev, vm);
-		return ret;
+		goto out_put;
 	}
 
-	pkvm_vm_link_ptdev(vm, &ptdev->vm_node);
-
-	pkvm_spin_lock(&ptdev->lock);
-	ret = pkvm_publish_ptdev_mmio_contract_locked(vm, ptdev);
+	pkvm_spin_lock(&vm->lock);
+	ptdev->vm_handle = vm_handle;
+	ptdev->assignment_state = PKVM_PTDEV_ATTACHING;
+	list_add_tail(&ptdev->vm_node, &vm->ptdev_head);
+	pkvm_spin_unlock(&vm->lock);
 	pkvm_spin_unlock(&ptdev->lock);
-	if (ret) {
-		pkvm_detach_ptdev(ptdev, vm);
-		return ret;
-	}
-
 	return 0;
-}
 
-/* Caller holds vm->lock to keep the registered mapping list stable. */
-static void pkvm_dump_ptdev_pci_ids_locked(struct pkvm_vm *vm)
-{
-	struct pkvm_ptdev *ptdev;
-	int vm_handle = vm->kvm.arch.pkvm.handle;
-	unsigned int count = 0;
-
-	pkvm_info("ptdev-pci-id: vm=%d dev-list begin\n", vm_handle);
-	list_for_each_entry(ptdev, &vm->ptdev_head, vm_node) {
-		if (!ptdev->guest_pci_id_valid)
-			continue;
-
-		pkvm_info("ptdev-pci-id: vm=%d entry=%u host=0000:%02x:%02x.%x guest=%04x:%02x:%02x.%x\n",
-			  vm_handle, count++, ptdev->bdf >> 8,
-			  (ptdev->bdf >> 3) & 0x1f, ptdev->bdf & 0x7,
-			  ptdev->guest_segment, ptdev->guest_bdf >> 8,
-			  (ptdev->guest_bdf >> 3) & 0x1f,
-			  ptdev->guest_bdf & 0x7);
-	}
-	pkvm_info("ptdev-pci-id: vm=%d dev-list end entries=%u\n",
-		  vm_handle, count);
+out_put:
+	pkvm_spin_unlock(&ptdev->lock);
+	pkvm_put_ptdev(ptdev);
+	return ret;
 }
 
 int pkvm_register_ptdev_pci_id(struct pkvm_vm *vm, u64 host_id, u64 guest_id)
@@ -749,10 +746,6 @@ int pkvm_register_ptdev_pci_id(struct pkvm_vm *vm, u64 host_id, u64 guest_id)
 	/* Keep the existing ptdev -> VM lock order used by BAR publication. */
 	pkvm_spin_lock(&ptdev->lock);
 	pkvm_spin_lock(&vm->lock);
-	if (vm->kvm.arch.pkvm.finalized) {
-		ret = -EBUSY;
-		goto out;
-	}
 	if (ptdev->vm_handle != vm->kvm.arch.pkvm.handle) {
 		ret = -EPERM;
 		goto out;
@@ -768,7 +761,7 @@ int pkvm_register_ptdev_pci_id(struct pkvm_vm *vm, u64 host_id, u64 guest_id)
 		goto out;
 	}
 
-	/* vm->lock serializes duplicate checks, publication and finalize. */
+	/* vm->lock serializes duplicate guest PCI identity checks. */
 	list_for_each_entry(other, &vm->ptdev_head, vm_node) {
 		if (other != ptdev && other->guest_pci_id_valid &&
 		    other->guest_segment == guest_segment &&
@@ -782,8 +775,6 @@ int pkvm_register_ptdev_pci_id(struct pkvm_vm *vm, u64 host_id, u64 guest_id)
 	ptdev->guest_bdf = guest_bdf;
 	ptdev->guest_pci_id_valid = true;
 out:
-	if (!ret)
-		pkvm_dump_ptdev_pci_ids_locked(vm);
 	pkvm_spin_unlock(&vm->lock);
 	pkvm_spin_unlock(&ptdev->lock);
 	pkvm_put_ptdev(ptdev);
@@ -793,22 +784,11 @@ out:
 int pkvm_remove_ptdev(u16 bdf, struct pkvm_vm *vm)
 {
 	struct pkvm_ptdev *ptdev;
-	int vm_handle;
 	int ret;
 
 	ptdev = pkvm_get_ptdev(bdf);
 	if (!ptdev)
 		return -ENODEV;
-
-	vm_handle = vm->kvm.arch.pkvm.handle;
-
-	pkvm_spin_lock(&ptdev->lock);
-	if (ptdev->vm_handle != vm_handle) {
-		pkvm_spin_unlock(&ptdev->lock);
-		pkvm_put_ptdev(ptdev);
-		return -ENODEV;
-	}
-	pkvm_spin_unlock(&ptdev->lock);
 
 	ret = pkvm_detach_ptdev(ptdev, vm);
 	/* Drop the lookup reference, even if detach failed. */
@@ -828,15 +808,6 @@ void pkvm_vm_destroy_ptdevs(struct pkvm_vm *vm)
 			continue;
 		}
 		pkvm_spin_unlock(&vm->lock);
-
-		pkvm_spin_lock(&ptdev->lock);
-		if (ptdev->vm_handle != vm->kvm.arch.pkvm.handle) {
-			pkvm_spin_unlock(&ptdev->lock);
-			pkvm_put_ptdev(ptdev);
-			pkvm_spin_lock(&vm->lock);
-			continue;
-		}
-		pkvm_spin_unlock(&ptdev->lock);
 
 		pkvm_detach_ptdev(ptdev, vm);
 		pkvm_put_ptdev(ptdev);
@@ -905,6 +876,11 @@ static int pkvm_publish_ptdev_mmio_contract_locked(struct pkvm_vm *vm,
 
 	if (!pkvm_ptdev_allows_guest_bar_mapping_locked(ptdev))
 		return -EAGAIN;
+
+	ret = pkvm_iommu_resume_dev_dma(ptdev,
+					vm->kvm.arch.pkvm.handle);
+	if (ret)
+		return ret;
 
 	ret = pkvm_add_vm_mmio_allowlist(vm, ptdev);
 	if (ret) {
@@ -977,6 +953,12 @@ int pkvm_set_ptdev_mmio_metadata(struct pkvm_vm *vm,
 	pkvm_spin_unlock(&vm->lock);
 	if (ret)
 		goto out;
+
+	/* Allow one immutable metadata snapshot per completed attachment. */
+	if (ptdev->assignment_state != PKVM_PTDEV_ATTACHING) {
+		ret = -EAGAIN;
+		goto out;
+	}
 
 	if (!ptdev->mmio_metadata_valid) {
 		ret = pkvm_validate_ptdev_mmio_metadata_locked(ptdev, metadata);
@@ -1083,42 +1065,31 @@ static int pkvm_write_guest_gpa(struct kvm_vcpu *vcpu, gpa_t gpa,
 	return ret;
 }
 
-int pkvm_handle_ptdev_pci_list(struct kvm_vcpu *vcpu, gpa_t guest_gpa,
-			       u64 max_entries)
+int pkvm_handle_ptdev_pdma_allowed(struct kvm_vcpu *vcpu, u64 guest_segment,
+				   u64 guest_bdf)
 {
-	struct pkvm_guest_ptdev_pci_id entries[PKVM_GUEST_PTDEV_MAX_DEVS];
 	struct pkvm_vm *vm = to_pkvm(vcpu->kvm);
 	struct pkvm_ptdev *ptdev;
-	unsigned int nr_entries = 0;
-	int ret = 0;
+	int allowed = 0;
 
-	pkvm_info("ptdev-pci-list: guest request vm=%d\n",
-		  vm->kvm.arch.pkvm.handle);
-
-	if (!guest_gpa || !max_entries || max_entries > ARRAY_SIZE(entries))
-		return -KVM_EINVAL;
-	if (guest_gpa > U64_MAX - max_entries * sizeof(entries[0]))
+	if (guest_segment > U16_MAX || guest_bdf > U16_MAX)
 		return -KVM_EINVAL;
 
+	/* Registration and detach update the guest identity under vm->lock. */
 	pkvm_spin_lock(&vm->lock);
 	list_for_each_entry(ptdev, &vm->ptdev_head, vm_node) {
-		if (!ptdev->guest_pci_id_valid)
+		if (!ptdev->guest_pci_id_valid ||
+		    ptdev->vm_handle != vm->kvm.arch.pkvm.handle)
 			continue;
-		if (nr_entries == max_entries) {
-			ret = -KVM_E2BIG;
+		if (ptdev->guest_segment == guest_segment &&
+		    ptdev->guest_bdf == guest_bdf) {
+			allowed = 1;
 			break;
 		}
-		entries[nr_entries].guest_segment = ptdev->guest_segment;
-		entries[nr_entries].guest_bdf = ptdev->guest_bdf;
-		nr_entries++;
 	}
 	pkvm_spin_unlock(&vm->lock);
-	if (ret)
-		return ret;
 
-	ret = pkvm_write_guest_gpa(vcpu, guest_gpa, entries,
-				   nr_entries * sizeof(entries[0]));
-	return ret ? -KVM_EFAULT : nr_entries;
+	return allowed;
 }
 
 int pkvm_handle_ptdev_mmio_info(struct kvm_vcpu *vcpu, gpa_t guest_gpa,

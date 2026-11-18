@@ -171,6 +171,8 @@ struct domain_map_data {
 	u64 nr_pages;
 	u64 prot;
 	struct pkvm_memcache mc;
+	/* Held host KVM reference on input; required VM handle on -EAGAIN. */
+	s64 vm_handle;
 };
 
 struct modify_irte_data {

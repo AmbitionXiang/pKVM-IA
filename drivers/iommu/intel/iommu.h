@@ -661,6 +661,11 @@ struct qi_batch {
 /* domain.vm_handle >= 0 indicates this domain is bound to a pVM */
 
 #ifdef __PKVM_HYP__
+struct pkvm_pending_ptdev {
+	u32 pasid;
+	u16 bdf;
+};
+
 struct pkvm_vm;
 struct dmar_domain;
 #define PKVM_P2P_MAX_DOMAINS	64
@@ -686,6 +691,10 @@ struct dmar_domain {
 #ifndef __PKVM_HYP__
 	int	nid;			/* node id */
 	struct xarray iommu_array;	/* Attached IOMMU array */
+#ifdef CONFIG_PKVM_INTEL
+	/* Held from the first VM DMA map until successful domain teardown. */
+	struct kvm *kvm;
+#endif
 #endif
 
 	u8 iommu_coherency: 1;		/* indicate coherency of iommu access */
@@ -795,7 +804,8 @@ struct dmar_domain {
 	struct pkvm_p2p_contract *p2p_contract;
 	/* PKVM: BDFs of devices that have pasid_setup_sl but not yet attach_ptdev */
 #define MAX_PENDING_BDFS	8
-	u16 pending_bdfs[MAX_PENDING_BDFS];
+	struct pkvm_pending_ptdev pending_devs[MAX_PENDING_BDFS];
+	bool pending_dma_blocked;
 	u8 pending_count;
 #endif /* !__PKVM_HYP__ */
 };
@@ -928,6 +938,8 @@ struct intel_iommu {
 	 * translation structures.
 	 */
 	void		*donation_page;
+	/* A failed invalidation must never permit device handoff. */
+	bool		invalidation_failed;
 	pkvm_spinlock_t lock;
 };
 
@@ -1259,6 +1271,19 @@ static inline void context_clear_present(struct context_entry *context)
 	WRITE_ONCE(context->lo, val);
 	dma_wmb();
 }
+
+#ifdef __PKVM_HYP__
+/*
+ * With iommu->lock held, a non-present entry retaining configuration is
+ * paused. Setup publishes Present before unlocking; teardown clears both
+ * words before unlocking. Only DMA pause leaves this intermediate state.
+ */
+static inline bool context_dma_paused(struct context_entry *context)
+{
+	return !(READ_ONCE(context->lo) & 1) &&
+		(READ_ONCE(context->lo) || READ_ONCE(context->hi));
+}
+#endif
 
 static inline void context_set_fault_enable(struct context_entry *context)
 {

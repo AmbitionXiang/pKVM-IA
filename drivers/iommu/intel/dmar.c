@@ -1447,8 +1447,14 @@ int qi_submit_sync(struct intel_iommu *iommu, struct qi_desc *desc,
 	u64 type;
 #endif
 
-	if (!qi)
+	if (!qi) {
+#ifdef __PKVM_HYP__
+		WRITE_ONCE(iommu->invalidation_failed, true);
+		return -EIO;
+#else
 		return 0;
+#endif
+	}
 
 #ifndef __PKVM_HYP__
 	if (WARN_ON_ONCE(pkvm_enabled()))
@@ -1565,6 +1571,10 @@ restart:
 				ktime_to_ns(ktime_get()) - iec_start_ktime);
 #endif
 
+#ifdef __PKVM_HYP__
+	if (rc)
+		WRITE_ONCE(iommu->invalidation_failed, true);
+#endif
 	return rc;
 }
 
