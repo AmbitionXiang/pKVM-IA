@@ -671,6 +671,10 @@ struct dmar_domain {
 #ifndef __PKVM_HYP__
 	int	nid;			/* node id */
 	struct xarray iommu_array;	/* Attached IOMMU array */
+#ifdef CONFIG_PKVM_INTEL
+	/* Held from the first VM DMA map until successful domain teardown. */
+	struct kvm *kvm;
+#endif
 #endif
 
 	u8 iommu_coherency: 1;		/* indicate coherency of iommu access */

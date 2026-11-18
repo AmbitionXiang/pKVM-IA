@@ -328,14 +328,27 @@ static int iommu_domain_map(struct domain_map_data *data)
 	}
 
 	pkvm_spin_lock(&domain->lock);
-	if (domain->vm_handle == PKVM_DOMAIN_UNBOUND)
-		domain->vm_handle = owner;
-	if (domain->vm_handle != owner) {
+	if (domain->vm_handle != PKVM_DOMAIN_UNBOUND &&
+	    domain->vm_handle != owner) {
 		pkvm_err("%s: domain owner=%d, HPA owner=%d\n",
 			 __func__, domain->vm_handle, owner);
 		ret = -EPERM;
 		goto out_unlock;
 	}
+	if (data->vm_handle != PKVM_DOMAIN_UNBOUND &&
+	    data->vm_handle != owner) {
+		ret = -EPERM;
+		goto out_unlock;
+	}
+	if (owner >= 0 && data->vm_handle == PKVM_DOMAIN_UNBOUND) {
+		/* Acquire the host KVM reference before pinning or mapping RAM. */
+		data->vm_handle = owner;
+		ret = -EAGAIN;
+		goto out_unlock;
+	}
+	data->vm_handle = owner;
+	if (domain->vm_handle == PKVM_DOMAIN_UNBOUND)
+		domain->vm_handle = owner;
 	if (data->mc.count) {
 		ret = refill_domain_memcache(domain, &data->mc);
 		if (ret) {

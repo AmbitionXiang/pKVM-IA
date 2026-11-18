@@ -3945,9 +3945,11 @@ static void intel_iommu_domain_free(struct iommu_domain *domain)
 		if (pkvm_enabled()) {
 			int ret = pkvm_free_domain(dmar_domain);
 
-			if (ret)
+			if (ret) {
 				pr_err("pkvm_free_domain failed [pgd=%p] (err=%d)\n",
 					dmar_domain->pgd, ret);
+				return;
+			}
 		} else {
 			domain_unmap(dmar_domain, 0, DOMAIN_MAX_PFN(dmar_domain->gaw),
 				     &freelist);

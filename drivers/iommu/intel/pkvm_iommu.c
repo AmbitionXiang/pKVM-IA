@@ -6,6 +6,7 @@
 #define pr_fmt(fmt)     "DMAR: pkvm: " fmt
 
 #include <linux/kernel.h>
+#include <linux/kvm_host.h>
 #include <linux/module.h>
 #include "iommu.h"
 #include "pasid.h"
@@ -364,13 +365,52 @@ static void free_domain_memcache(struct pkvm_memcache *mc)
 		iommu_free_pages(pop_pkvm_memcache_page(mc, host_va));
 }
 
+static int pkvm_domain_get_kvm(struct dmar_domain *domain, int vm_handle, gfp_t gfp)
+{
+	struct kvm *kvm, *old;
+	int ret = -ENOENT;
+
+	/* The VM list is mutex-protected; an atomic first map must retry. */
+	if (!gfpflags_allow_blocking(gfp))
+		return -EAGAIN;
+
+	mutex_lock(&kvm_lock);
+	list_for_each_entry(kvm, &vm_list, vm_list) {
+		if (!pkvm_is_protected_vm(kvm) ||
+		    kvm->arch.pkvm.handle != vm_handle)
+			continue;
+		if (kvm_get_kvm_safe(kvm))
+			ret = 0;
+		break;
+	}
+	mutex_unlock(&kvm_lock);
+	if (ret)
+		return ret;
+
+	/* Concurrent first maps retain exactly one reference per domain. */
+	old = cmpxchg(&domain->kvm, NULL, kvm);
+	if (old) {
+		ret = old == kvm ? 0 : -EPERM;
+		kvm_put_kvm(kvm);
+	}
+
+	return ret;
+}
+
 int pkvm_free_domain(struct dmar_domain *domain)
 {
 	union pkvm_hc_data out;
+	struct kvm *kvm;
 	int ret;
 
 	ret = pkvm_hypercall_out(iommu_free_domain, &out, virt_to_phys(domain->pgd));
 	free_domain_memcache(&out.iommu_free_domain.memcache);
+	if (!ret && domain->kvm) {
+		/* Hyp has removed all DMA mappings before the VM can be destroyed. */
+		kvm = domain->kvm;
+		domain->kvm = NULL;
+		kvm_put_kvm(kvm);
+	}
 	return ret;
 }
 
@@ -380,6 +420,7 @@ int pkvm_domain_map(struct dmar_domain *domain, unsigned long iov_pfn,
 {
 	union pkvm_hc_data d = { 0 };
 	struct domain_map_data *data = &d.iommu_domain_map.in;
+	struct kvm *kvm = READ_ONCE(domain->kvm);
 	int ret;
 
 	data->pgd_gpa = virt_to_phys(domain->pgd);
@@ -388,8 +429,15 @@ int pkvm_domain_map(struct dmar_domain *domain, unsigned long iov_pfn,
 	data->nr_pages = nr_pages;
 	data->prot = prot;
 	data->mc.flags = PKVM_MC_DONATE_SHARE_RO;
+	data->vm_handle = kvm ? kvm->arch.pkvm.handle : PKVM_DOMAIN_UNBOUND;
 
 	ret = pkvm_hypercall_inout(iommu_domain_map, &d, &d);
+	if (ret == -EAGAIN) {
+		ret = pkvm_domain_get_kvm(domain, data->vm_handle, gfp);
+		if (ret)
+			goto out;
+		ret = pkvm_hypercall_inout(iommu_domain_map, &d, &d);
+	}
 	if (ret == -ENOMEM) {
 		struct mc_alloc_arg arg = {
 			.nid = domain->nid,
@@ -404,6 +452,7 @@ int pkvm_domain_map(struct dmar_domain *domain, unsigned long iov_pfn,
 			pr_err("%s: memcache topup failed(err=%d)\n", __func__, ret);
 	}
 
+out:
 	if (ret) {
 		pr_err("%s: domain map[iov_pfn: %lx, pfn: %lx, nr_pages: %lu] failed (err=%d)\n",
 		       __func__, iov_pfn, phys_pfn, nr_pages, ret);
