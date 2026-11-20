@@ -48,7 +48,7 @@ int nr_satc_devs;
 static struct intel_iommu iommus[PKVM_MAX_IOMMU_NUM];
 static int nr_iommus;
 
-/* P2P collection only: freeze table updates, in a fixed lock order. */
+/* Freeze binding updates and membership readers in a fixed lock order. */
 void pkvm_iommu_lock_bindings(void)
 {
 	int i;
@@ -65,6 +65,7 @@ void pkvm_iommu_unlock_bindings(void)
 		pkvm_spin_unlock(&iommus[i - 1].lock);
 }
 
+/* Return 0: unused, 1: configured/paused, 2: at least one active binding. */
 /* Caller holds iommu->lock. Inspect tables without allocating any entries. */
 static int pkvm_p2p_context_uses_domain(struct intel_iommu *iommu,
 				      struct context_entry *context,
@@ -80,7 +81,7 @@ static int pkvm_p2p_context_uses_domain(struct intel_iommu *iommu,
 			return 0;
 		if (domain->use_first_level)
 			return -EPERM;
-		return 1;
+		return context_present(context) ? 2 : 1;
 	}
 
 	dir = __pkvm_va(context->lo & VTD_PAGE_MASK);
@@ -94,7 +95,7 @@ static int pkvm_p2p_context_uses_domain(struct intel_iommu *iommu,
 			u64 root;
 			u16 type;
 
-			if (!pasid_pte_is_present(entry))
+			if (!pasid_entry_configured(entry))
 				continue;
 			type = pasid_pte_get_pgtt(entry);
 			if (type == PASID_ENTRY_PGTT_FL_ONLY)
@@ -108,7 +109,7 @@ static int pkvm_p2p_context_uses_domain(struct intel_iommu *iommu,
 			if (domain->use_first_level !=
 			    (type == PASID_ENTRY_PGTT_FL_ONLY))
 				return -EPERM;
-			used = 1;
+			used = max(used, pasid_pte_is_present(entry) ? 2 : 1);
 		}
 	}
 	return used;
@@ -133,7 +134,8 @@ int pkvm_iommu_p2p_domain_is_used(struct pkvm_vm *vm, struct dmar_domain *domain
 				int ret;
 
 				context = iommu_context_addr(iommu, bus, devfn, 0);
-				if (!context || !context_present(context))
+				if (!context || (!context_present(context) &&
+						 !context_dma_paused(context)))
 					continue;
 				ret = pkvm_p2p_context_uses_domain(iommu, context, domain);
 				if (ret < 0)
@@ -143,13 +145,20 @@ int pkvm_iommu_p2p_domain_is_used(struct pkvm_vm *vm, struct dmar_domain *domain
 				list_for_each_entry(ptdev, &vm->ptdev_head, vm_node) {
 					if (ptdev->bdf == PCI_DEVID(bus, devfn) &&
 					    ptdev->vm_handle == vm->kvm.arch.pkvm.handle) {
+						/* A departing binding must already be paused. */
+						if (READ_ONCE(ptdev->assignment_state) ==
+						    PKVM_PTDEV_RESTORING) {
+							if (ret == 2)
+								return -EPERM;
+							ret = 0;
+						}
 						attached = true;
 						break;
 					}
 				}
 				if (!attached)
 					return -EPERM;
-				used = 1;
+				used |= !!ret;
 			}
 		}
 	}

@@ -182,7 +182,8 @@ extern struct dmar_domain pt_domain;
 void init_pt_domain(void);
 
 int pkvm_iommu_map_p2p(int vm_handle);
-void pkvm_iommu_unmap_p2p(struct pkvm_vm *vm);
+int pkvm_iommu_rebuild_p2p(struct pkvm_vm *vm);
+int pkvm_iommu_unmap_p2p(struct pkvm_vm *vm);
 void pkvm_iommu_lock_bindings(void);
 void pkvm_iommu_unlock_bindings(void);
 int pkvm_iommu_p2p_domain_is_used(struct pkvm_vm *vm, struct dmar_domain *domain);

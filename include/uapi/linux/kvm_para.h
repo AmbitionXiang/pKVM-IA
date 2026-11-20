@@ -71,6 +71,15 @@ struct pkvm_guest_mmio_allow_range {
 };
 
 /*
+ * PTDEV_MMIO_READ: a0 = guest buffer GPA, a1 = number of ranges,
+ * a2 = start index, a3 = expected generation returned by PTDEV_MMIO_INFO.
+ * Returns -EAGAIN without writing the buffer if the generation changed.
+ * A zero count validates the generation without copying any ranges.
+ * Callers and the hypervisor must both implement this generation argument;
+ * the original three-argument interface did not provide this guarantee.
+ */
+
+/*
  * hypercalls use architecture specific
  */
 #include <asm/kvm_para.h>

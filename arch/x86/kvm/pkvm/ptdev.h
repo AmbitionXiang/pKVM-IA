@@ -69,6 +69,8 @@ struct pkvm_ptdev {
 
 	int vm_handle;
 	bool guest_contract_published;
+	/* Retain cleanup ownership after allowlist withdrawal, including retries. */
+	bool guest_mmio_unmap_pending;
 	enum pkvm_ptdev_owner owner;
 	enum pkvm_ptdev_assignment_state assignment_state;
 	unsigned long managed_bar_mask;
@@ -89,18 +91,19 @@ int pkvm_detach_ptdev(struct pkvm_ptdev *ptdev, struct pkvm_vm *vm);
 int pkvm_attach_ptdev(u16 bdf, struct pkvm_vm *vm);
 int pkvm_remove_ptdev(u16 bdf, struct pkvm_vm *vm);
 int pkvm_register_ptdev_pci_id(struct pkvm_vm *vm, u64 host_id, u64 guest_id);
-void pkvm_vm_destroy_ptdevs(struct pkvm_vm *vm);
+int pkvm_vm_destroy_ptdevs(struct pkvm_vm *vm);
 int pkvm_set_ptdev_mmio_metadata(struct pkvm_vm *vm,
 				 const struct kvm_ptdev_mmio_metadata *metadata);
 int pkvm_get_ptdev_mmio_info(struct pkvm_vm *vm,
 			     struct pkvm_guest_mmio_info *info);
 int pkvm_read_ptdev_mmio_allow_ranges(struct pkvm_vm *vm, u16 start,
-				      u16 nr_ranges,
+				      u16 nr_ranges, u16 generation,
 				      struct pkvm_guest_mmio_allow_range *ranges);
 int pkvm_handle_ptdev_mmio_info(struct kvm_vcpu *vcpu, gpa_t guest_gpa,
 				unsigned long size);
 int pkvm_handle_ptdev_mmio_read(struct kvm_vcpu *vcpu, gpa_t guest_gpa,
-				u16 nr_ranges, u16 start);
+				u16 nr_ranges, u16 start,
+				unsigned long generation);
 int pkvm_handle_ptdev_pdma_allowed(struct kvm_vcpu *vcpu, u64 guest_segment,
 				   u64 guest_bdf);
 bool pkvm_host_hpa_hits_boot_ptdev_bar(u64 hpa, u64 size);

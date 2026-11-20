@@ -36,7 +36,8 @@ static bool pkvm_p2p_owner_is_attached(struct pkvm_vm *vm, u16 bdf)
 
 	list_for_each_entry(ptdev, &vm->ptdev_head, vm_node)
 		if (ptdev->bdf == bdf && ptdev->vm_handle ==
-		    vm->kvm.arch.pkvm.handle)
+		    vm->kvm.arch.pkvm.handle &&
+		    READ_ONCE(ptdev->assignment_state) != PKVM_PTDEV_RESTORING)
 			return true;
 
 	return false;
@@ -49,6 +50,8 @@ int pkvm_iommu_p2p_check_binding(struct dmar_domain *domain, u16 bdf)
 
 	if (!contract)
 		return 0;
+	if (READ_ONCE(contract->blocked))
+		return -EBUSY;
 
 	/* The IOMMU lock prevents withdrawal and thus VM membership changes. */
 	return pkvm_p2p_owner_is_attached(contract->vm, bdf) ? 0 : -EPERM;
@@ -137,8 +140,25 @@ static int pkvm_p2p_collect_contract(struct pkvm_vm *vm,
 	return contract->domain_count ? 0 : -ENODEV;
 }
 
-/* Caller holds domain->lock. Only pass ranges prechecked for this transaction. */
-static void pkvm_p2p_unmap_bars(struct pkvm_p2p_contract *contract,
+/* Caller holds domain->lock. */
+static int pkvm_p2p_domain_error(struct dmar_domain *domain)
+{
+	struct cache_tag *tag;
+	int ret = 0;
+
+	/* Include every source IOMMU/ATS cache, not just the departing device. */
+	pkvm_spin_lock(&domain->cache_lock);
+	list_for_each_entry(tag, &domain->cache_tags, node) {
+		if (READ_ONCE(tag->iommu->invalidation_failed)) {
+			ret = -EIO;
+			break;
+		}
+	}
+	pkvm_spin_unlock(&domain->cache_lock);
+	return ret;
+}
+
+static int pkvm_p2p_unmap_bars(struct pkvm_p2p_contract *contract,
 				struct dmar_domain *domain, unsigned int ranges)
 {
 	unsigned int r;
@@ -150,33 +170,33 @@ static void pkvm_p2p_unmap_bars(struct pkvm_p2p_contract *contract,
 			     (range->iova + range->size - 1) >> VTD_PAGE_SHIFT,
 			     NULL);
 	}
+	return pkvm_p2p_domain_error(domain);
 }
 
-int pkvm_iommu_map_p2p(int vm_handle)
+/* Caller holds vm->lock and serializes membership/allowlist changes. */
+static int pkvm_p2p_map_locked(struct pkvm_vm *vm)
 {
-	struct pkvm_vm *vm = pkvm_get_vm(vm_handle);
+	int vm_handle = vm->kvm.arch.pkvm.handle;
 	struct pkvm_p2p_contract *contract;
 	unsigned int d, r;
 	int ret;
 
-	if (!vm)
-		return -EINVAL;
-
 	/* Match allowlist withdrawal: vm->lock precedes pkvm_p2p_lock. */
-	pkvm_spin_lock(&vm->lock);
 	pkvm_spin_lock(&pkvm_p2p_lock);
 	contract = &pkvm_p2p_contracts[vm_handle];
 	if (contract->vm) {
-		ret = contract->vm == vm ? 0 : -EPERM;
+		ret = contract->vm != vm ? -EPERM :
+			(contract->blocked ? -EIO : 0);
 		goto out_unlock;
 	}
 
 	if (!vm->mmio_allow_nr_ranges) {
-		ret = -EAGAIN;
+		ret = 0;
 		goto out_unlock;
 	}
 	memset(contract, 0, sizeof(*contract));
 	contract->vm = vm;
+	contract->blocked = true;
 	pkvm_iommu_lock_bindings();
 	pkvm_spin_lock(&iommu_domain_lock);
 	ret = pkvm_p2p_collect_contract(vm, contract);
@@ -186,12 +206,19 @@ int pkvm_iommu_map_p2p(int vm_handle)
 		pkvm_p2p_release_contract(contract);
 		goto out_unlock;
 	}
+	/* Keep recovery records reachable even if mapping rollback fails. */
+	vm->p2p_contract = contract;
 
 	/* Keep each domain locked from precheck through mapping or local rollback. */
 	for (d = 0; d < contract->domain_count; d++) {
 		struct dmar_domain *domain = contract->domains[d];
 
 		pkvm_spin_lock(&domain->lock);
+		ret = pkvm_p2p_domain_error(domain);
+		if (ret) {
+			pkvm_spin_unlock(&domain->lock);
+			goto rollback;
+		}
 		for (r = 0; r < contract->range_count; r++) {
 			struct pkvm_p2p_range *range = &contract->ranges[r];
 
@@ -208,23 +235,23 @@ int pkvm_iommu_map_p2p(int vm_handle)
 		for (r = 0; r < contract->range_count; r++) {
 			struct pkvm_p2p_range *range = &contract->ranges[r];
 
+			contract->mapped_ranges[d] = r + 1;
 			ret = pkvm_domain_map_peer(domain,
 					range->iova >> VTD_PAGE_SHIFT,
 					range->hpa >> VTD_PAGE_SHIFT,
 					range->size >> VTD_PAGE_SHIFT);
-			if (ret) {
-				/* Include the range whose map may have partially succeeded. */
-				pkvm_p2p_unmap_bars(contract, domain, r + 1);
+			if (ret)
 				break;
-			}
 		}
+		if (!ret)
+			ret = pkvm_p2p_domain_error(domain);
 		pkvm_spin_unlock(&domain->lock);
 		if (ret)
 			goto rollback;
 	}
 
 	ret = 0;
-	vm->p2p_contract = contract;
+	WRITE_ONCE(contract->blocked, false);
 	pkvm_info("[AUTO-P2P] committed vm=%d domains=%u ranges=%u\n",
 		  vm_handle, contract->domain_count, contract->range_count);
 	for (d = 0; d < contract->domain_count; d++) {
@@ -244,42 +271,84 @@ int pkvm_iommu_map_p2p(int vm_handle)
 	goto out_unlock;
 
 rollback:
-	/* The current domain was either untouched or rolled back under its lock. */
-	while (d) {
-		struct dmar_domain *domain = contract->domains[--d];
-
-		pkvm_spin_lock(&domain->lock);
-		pkvm_p2p_unmap_bars(contract, domain, contract->range_count);
-		pkvm_spin_unlock(&domain->lock);
-	}
-	pkvm_p2p_release_contract(contract);
+	/* Use the same checked withdrawal as hot-unplug, after dropping its lock. */
+	pkvm_spin_unlock(&pkvm_p2p_lock);
+	if (pkvm_iommu_unmap_p2p(vm))
+		return -EIO;
+	return ret;
 out_unlock:
 	pkvm_spin_unlock(&pkvm_p2p_lock);
-	pkvm_spin_unlock(&vm->lock);
-	pkvm_put_vm(vm);
 	return ret;
 }
 
-void pkvm_iommu_unmap_p2p(struct pkvm_vm *vm)
+/* Caller holds vm->lock. Failure retains all cleanup records and references. */
+int pkvm_iommu_unmap_p2p(struct pkvm_vm *vm)
 {
 	struct pkvm_p2p_contract *contract;
 	unsigned int d;
+	int ret = 0;
 
 	pkvm_spin_lock(&pkvm_p2p_lock);
 	contract = vm->p2p_contract;
 	if (!contract)
 		goto out;
+	if (contract->invalidation_failed) {
+		ret = -EIO;
+		goto out;
+	}
+	WRITE_ONCE(contract->blocked, true);
 	for (d = 0; d < contract->domain_count; d++) {
 		struct dmar_domain *domain = contract->domains[d];
 
 		pkvm_spin_lock(&domain->lock);
-		pkvm_p2p_unmap_bars(contract, domain, contract->range_count);
+		if (contract->mapped_ranges[d]) {
+			int err = pkvm_p2p_unmap_bars(contract, domain,
+						    contract->mapped_ranges[d]);
+
+			if (err)
+				ret = err;
+			else
+				contract->mapped_ranges[d] = 0;
+		}
 		pkvm_spin_unlock(&domain->lock);
+	}
+	if (ret) {
+		/* Cache tags may later disappear; never forget a failed invalidation. */
+		contract->invalidation_failed = true;
+		goto out;
 	}
 	pkvm_p2p_release_contract(contract);
 	vm->p2p_contract = NULL;
 out:
 	pkvm_spin_unlock(&pkvm_p2p_lock);
+	return ret;
+}
+
+/* Metadata publication/detach owns mmio_metadata_busy across this operation. */
+int pkvm_iommu_rebuild_p2p(struct pkvm_vm *vm)
+{
+	int ret;
+
+	pkvm_spin_lock(&vm->lock);
+	ret = pkvm_iommu_unmap_p2p(vm);
+	if (!ret && vm->kvm.arch.pkvm.finalized && !vm->ptdev_teardown)
+		ret = pkvm_p2p_map_locked(vm);
+	pkvm_spin_unlock(&vm->lock);
+	return ret;
+}
+
+int pkvm_iommu_map_p2p(int vm_handle)
+{
+	struct pkvm_vm *vm = pkvm_get_vm(vm_handle);
+	int ret;
+
+	if (!vm)
+		return -EINVAL;
+	pkvm_spin_lock(&vm->lock);
+	ret = vm->mmio_metadata_busy ? -EBUSY : pkvm_p2p_map_locked(vm);
+	pkvm_spin_unlock(&vm->lock);
+	pkvm_put_vm(vm);
+	return ret;
 }
 
 #endif

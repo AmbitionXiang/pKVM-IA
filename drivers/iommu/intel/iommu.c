@@ -1773,6 +1773,12 @@ int pkvm_context_set_dma_enabled(struct dmar_domain *domain,
 	}
 	if (enabled && !paused)
 		goto out;
+	if (enabled) {
+		ret = pkvm_iommu_p2p_check_binding(domain,
+						 PCI_DEVID(info->bus, info->devfn));
+		if (ret)
+			goto out;
+	}
 	pkvm_populate_dev_info_from_ce(info, context);
 	did = context_domain_id(context);
 	if (enabled) {

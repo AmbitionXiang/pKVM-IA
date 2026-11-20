@@ -251,7 +251,10 @@ static int pkvm_vm_destroy(int vm_handle, struct pkvm_memcache *mc)
 	shared_kvm_pa = __pkvm_pa(pkvm_vm->shared_kvm);
 
 #ifdef CONFIG_PKVM_INTEL
-	pkvm_vm_destroy_ptdevs(pkvm_vm);
+	i = pkvm_vm_destroy_ptdevs(pkvm_vm);
+	if (i)
+		/* Keep the detached handle, VM and DMA backing quarantined on failure. */
+		return i;
 #endif
 
 	kvm_x86_call(vm_destroy)(&pkvm_vm->kvm);

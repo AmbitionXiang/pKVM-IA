@@ -1433,7 +1433,7 @@ int pkvm_host_map_guest_mmio(struct kvm_vcpu *vcpu, unsigned long gpa,
 
 #ifdef CONFIG_PKVM_INTEL
 	/* Recheck under the same lock used to revoke BAR mappings on detach. */
-	if (!pkvm_vm_hpa_hits_attached_boot_ptdev_bar(vcpu->kvm, hpa, size)) {
+	if (!pkvm_vm_mmio_mapping_allowed(pkvm_vm, gpa, hpa, size)) {
 		ret = -EPERM;
 		goto unlock;
 	}

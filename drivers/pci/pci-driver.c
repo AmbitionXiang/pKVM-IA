@@ -455,7 +455,9 @@ static int pci_device_probe(struct device *dev)
 
 	error = arch_pci_refresh_mmio_allowlist(pci_dev);
 	if (error) {
-		pci_err(pci_dev, "failed to refresh MMIO allowlist: %d\n", error);
+		pci_err(pci_dev,
+			"MMIO allowlist refresh failed (%d); device initialization aborted, driver not bound\n",
+			error);
 		return error;
 	}
 

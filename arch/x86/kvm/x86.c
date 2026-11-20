@@ -14147,7 +14147,7 @@ void kvm_arch_commit_memory_region(struct kvm *kvm,
 
 	kvm_mmu_slot_apply_flags(kvm, old, new, change);
 
-#ifndef __PKVM_HYP__
+#if defined(CONFIG_PKVM_X86) && !defined(__PKVM_HYP__)
 	if (change == KVM_MR_CREATE && pkvm_is_protected_vm(kvm)) {
 		unsigned long hva = new->userspace_addr;
 		unsigned long nr_pages = new->npages;
@@ -15225,7 +15225,7 @@ int pkvm_emulate_hypercall(struct kvm_vcpu *vcpu)
 		ret = pkvm_handle_ptdev_mmio_info(vcpu, a0, a1);
 		break;
 	case PKVM_GHC_PTDEV_MMIO_READ:
-		ret = pkvm_handle_ptdev_mmio_read(vcpu, a0, a1, a2);
+		ret = pkvm_handle_ptdev_mmio_read(vcpu, a0, a1, a2, a3);
 		break;
 #endif
 	case PKVM_GHC_GET_VE_GPA:

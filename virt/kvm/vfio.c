@@ -109,6 +109,7 @@ static void kvm_spapr_tce_release_vfio_group(struct kvm *kvm,
 }
 #endif
 
+#ifdef CONFIG_PKVM_X86
 int __weak kvm_arch_add_device_to_pkvm(struct kvm *kvm, struct file *file)
 {
 	return 0;
@@ -118,6 +119,7 @@ int __weak kvm_arch_remove_device_from_pkvm(struct kvm *kvm, struct file *file)
 {
 	return 0;
 }
+#endif
 
 /*
  * Groups/devices can use the same or different IOMMU domains. If the same
@@ -220,11 +222,13 @@ static int kvm_vfio_file_del(struct kvm_device *dev, unsigned int fd)
 		if (kvf->file != fd_file(f))
 			continue;
 
+		ret = kvm_arch_remove_device_from_pkvm(dev->kvm, kvf->file);
+		if (ret)
+			break;
 		list_del(&kvf->node);
 #ifdef CONFIG_SPAPR_TCE_IOMMU
 		kvm_spapr_tce_release_vfio_group(dev->kvm, kvf);
 #endif
-		kvm_arch_remove_device_from_pkvm(dev->kvm, kvf->file);
 		kvm_vfio_file_set_kvm(kvf->file, NULL);
 		fput(kvf->file);
 		kfree(kvf);

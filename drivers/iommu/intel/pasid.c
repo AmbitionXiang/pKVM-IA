@@ -487,6 +487,12 @@ int pkvm_pasid_set_dma_enabled(struct dmar_domain *domain,
 	if (enabled && !paused)
 		goto out;
 	if (enabled) {
+		ret = pkvm_iommu_p2p_check_binding(domain,
+						 PCI_DEVID(info->bus, info->devfn));
+		if (ret)
+			goto out;
+	}
+	if (enabled) {
 		pasid_set_present(pte);
 		pasid_flush_caches(iommu, pte, pasid, pasid_get_domain_id(pte));
 	} else if (!paused) {

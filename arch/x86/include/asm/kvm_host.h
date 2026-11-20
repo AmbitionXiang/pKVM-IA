@@ -805,6 +805,14 @@ struct kvm_ptdev_mmio_metadata {
 	struct kvm_protected_vm_ptdev_mmio_range
 		ranges[KVM_PROTECTED_VM_PTDEV_MMIO_MAX_RANGES];
 };
+
+/* One Host cleanup range; a device may own multiple entries. */
+struct kvm_ptdev_mmio_record {
+	u16 segment;
+	u16 bdf;
+	u64 guest_gpa;
+	u64 size;
+};
 #endif
 
 struct kvm_pkvm_vm {
@@ -819,6 +827,10 @@ struct kvm_pkvm_vm {
 	/* Synchronous submission mailbox, serialized by finalized_lock. */
 	bool ptdev_mmio_metadata_valid;
 	struct kvm_ptdev_mmio_metadata ptdev_mmio_metadata;
+	/* Same range capacity as pKVM; protected by finalized_lock. */
+	u16 ptdev_mmio_nr_records;
+	struct kvm_ptdev_mmio_record
+		ptdev_mmio_records[PKVM_GUEST_MMIO_ALLOW_MAX_RANGES];
 #endif
 };
 

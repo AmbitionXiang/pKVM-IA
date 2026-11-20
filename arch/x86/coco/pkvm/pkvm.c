@@ -152,6 +152,8 @@ static bool pkvm_direct_mmio_read(int size, unsigned long vaddr,
 }
 
 #ifdef CONFIG_PCI
+#define PKVM_MMIO_REFRESH_MAX_ATTEMPTS 3U
+
 static DEFINE_MUTEX(pkvm_mmio_refresh_lock);
 /* Static buffers provide GPAs for the hypercalls; serialize their use. */
 static struct pkvm_guest_mmio_info pkvm_mmio_refresh_info;
@@ -161,30 +163,41 @@ static struct pkvm_guest_mmio_allow_range
 static int pkvm_refresh_mmio_allowlist(void)
 {
 	unsigned long flags;
+	unsigned int attempt;
 	long ret;
 
 	mutex_lock(&pkvm_mmio_refresh_lock);
-	memset(&pkvm_mmio_refresh_info, 0, sizeof(pkvm_mmio_refresh_info));
-	memset(pkvm_mmio_refresh_ranges, 0, sizeof(pkvm_mmio_refresh_ranges));
+	for (attempt = 0; attempt < PKVM_MMIO_REFRESH_MAX_ATTEMPTS; attempt++) {
+		memset(&pkvm_mmio_refresh_info, 0, sizeof(pkvm_mmio_refresh_info));
+		memset(pkvm_mmio_refresh_ranges, 0, sizeof(pkvm_mmio_refresh_ranges));
 
-	ret = kvm_hypercall2(PKVM_GHC_PTDEV_MMIO_INFO,
-			     __pa(&pkvm_mmio_refresh_info),
-			     sizeof(pkvm_mmio_refresh_info));
-	if (ret)
-		goto out;
-
-	if (pkvm_mmio_refresh_info.nr_ranges >
-	    ARRAY_SIZE(pkvm_mmio_refresh_ranges)) {
-		ret = -E2BIG;
-		goto out;
-	}
-
-	if (pkvm_mmio_refresh_info.nr_ranges) {
-		ret = kvm_hypercall3(PKVM_GHC_PTDEV_MMIO_READ,
-				     __pa(pkvm_mmio_refresh_ranges),
-				     pkvm_mmio_refresh_info.nr_ranges, 0);
+		ret = kvm_hypercall2(PKVM_GHC_PTDEV_MMIO_INFO,
+				     __pa(&pkvm_mmio_refresh_info),
+				     sizeof(pkvm_mmio_refresh_info));
 		if (ret)
 			goto out;
+
+		if (pkvm_mmio_refresh_info.nr_ranges >
+		    ARRAY_SIZE(pkvm_mmio_refresh_ranges)) {
+			ret = -E2BIG;
+			goto out;
+		}
+
+		/* Validate the generation even when the allowlist is empty. */
+		ret = kvm_hypercall4(PKVM_GHC_PTDEV_MMIO_READ,
+				     __pa(pkvm_mmio_refresh_ranges),
+				     pkvm_mmio_refresh_info.nr_ranges, 0,
+				     pkvm_mmio_refresh_info.generation);
+		if (ret == -EAGAIN)
+			continue;
+		if (ret)
+			goto out;
+		break;
+	}
+	if (ret) {
+		pr_err("pKVM: MMIO allowlist changed during all %u refresh attempts\n",
+		       PKVM_MMIO_REFRESH_MAX_ATTEMPTS);
+		goto out;
 	}
 
 	/* Publish only a complete snapshot, including an empty allowlist. */

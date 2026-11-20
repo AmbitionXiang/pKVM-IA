@@ -680,7 +680,12 @@ struct pkvm_p2p_range {
 
 struct pkvm_p2p_contract {
 	struct pkvm_vm *vm;
+	/* Block new bindings while building or retaining a failed withdrawal. */
+	bool blocked;
+	bool invalidation_failed;
 	struct dmar_domain *domains[PKVM_P2P_MAX_DOMAINS];
+	/* Only these prefixes may have been mapped, including partial failures. */
+	u16 mapped_ranges[PKVM_P2P_MAX_DOMAINS];
 	u16 domain_count;
 	struct pkvm_p2p_range ranges[PKVM_P2P_MAX_RANGES];
 	u16 range_count;

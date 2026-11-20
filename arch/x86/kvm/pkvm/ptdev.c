@@ -312,10 +312,6 @@ static int pkvm_add_vm_mmio_allowlist(
 	}
 
 	pkvm_spin_lock(&vm->lock);
-	if (vm->kvm.arch.pkvm.finalized) {
-		ret = -EBUSY;
-		goto out;
-	}
 	nr_ranges = vm->mmio_allow_nr_ranges;
 	if (metadata->nr_ranges > ARRAY_SIZE(vm->mmio_allow_ranges) - nr_ranges) {
 		ret = -E2BIG;
@@ -357,13 +353,18 @@ out:
 	return ret;
 }
 
-static void pkvm_remove_vm_mmio_allowlist(struct pkvm_vm *vm, u16 bdf)
+static int pkvm_remove_vm_mmio_allowlist(struct pkvm_vm *vm, u16 bdf)
 {
 	u16 src, dst = 0, old_count;
+	int ret;
 
 	pkvm_spin_lock(&vm->lock);
 	/* No P2P map may observe the old allowlist after this unmap. */
-	pkvm_iommu_unmap_p2p(vm);
+	ret = pkvm_iommu_unmap_p2p(vm);
+	if (ret) {
+		pkvm_spin_unlock(&vm->lock);
+		return ret;
+	}
 	old_count = vm->mmio_allow_nr_ranges;
 	for (src = 0; src < old_count; src++) {
 		if (vm->mmio_allow_owner_bdf[src] == bdf)
@@ -382,6 +383,7 @@ static void pkvm_remove_vm_mmio_allowlist(struct pkvm_vm *vm, u16 bdf)
 		vm->mmio_allow_hpa[dst] = 0;
 	}
 	pkvm_spin_unlock(&vm->lock);
+	return 0;
 }
 
 struct pkvm_ptdev *pkvm_get_ptdev(u16 bdf)
@@ -449,25 +451,9 @@ void pkvm_put_ptdev(struct pkvm_ptdev *ptdev)
 	pkvm_spin_unlock(&ptdev_lock);
 }
 
-void pkvm_vm_link_ptdev(struct pkvm_vm *vm, struct list_head *node)
-{
-	pkvm_spin_lock(&vm->lock);
-	/* Binding authorization may read this list under an IOMMU lock. */
-	pkvm_iommu_unmap_p2p(vm);
-	list_add_tail(node, &vm->ptdev_head);
-	pkvm_spin_unlock(&vm->lock);
-}
-
-void pkvm_vm_unlink_ptdev(struct pkvm_vm *vm, struct list_head *node)
-{
-	pkvm_spin_lock(&vm->lock);
-	list_del(node);
-	pkvm_spin_unlock(&vm->lock);
-}
-
 static int pkvm_restore_ptdev_bars_locked(struct pkvm_vm *vm,
 					  struct pkvm_ptdev *ptdev);
-static void pkvm_withdraw_ptdev_mmio_contract_locked(struct pkvm_vm *vm,
+static int pkvm_withdraw_ptdev_mmio_contract_locked(struct pkvm_vm *vm,
 						     struct pkvm_ptdev *ptdev);
 
 /* A successful detach drops the reference retained by attach. */
@@ -480,18 +466,26 @@ int pkvm_detach_ptdev(struct pkvm_ptdev *ptdev, struct pkvm_vm *vm)
 		ret = -ENODEV;
 		goto out_unlock;
 	}
+	pkvm_spin_lock(&vm->lock);
+	if (vm->mmio_metadata_busy) {
+		pkvm_spin_unlock(&vm->lock);
+		ret = -EBUSY;
+		goto out_unlock;
+	}
+	vm->mmio_metadata_busy = true;
+	pkvm_spin_unlock(&vm->lock);
 
 	ret = pkvm_restore_ptdev_bars_locked(vm, ptdev);
 	if (ret) {
 		pkvm_err("pkvm: detach ptdev restore failed bdf=0x%x ret=%d\n",
 			 ptdev->bdf, ret);
-		goto out_unlock;
+		goto out_busy;
 	}
 
 	pkvm_spin_lock(&vm->lock);
+	/* The rebuilt contract excludes this paused device; synchronize readers. */
+	pkvm_iommu_lock_bindings();
 	list_del(&ptdev->vm_node);
-	/* A source device need not have published BAR ranges of its own. */
-	pkvm_iommu_unmap_p2p(vm);
 	ptdev->guest_pci_id_valid = false;
 	ptdev->guest_segment = 0;
 	ptdev->guest_bdf = 0;
@@ -499,8 +493,14 @@ int pkvm_detach_ptdev(struct pkvm_ptdev *ptdev, struct pkvm_vm *vm)
 	ptdev->guest_contract_published = false;
 	memset(&ptdev->mmio_metadata, 0, sizeof(ptdev->mmio_metadata));
 	ptdev->vm_handle = PKVM_PTDEV_VM_UNBOUND;
+	ptdev->assignment_state = PKVM_PTDEV_DETACHED;
+	pkvm_iommu_unlock_bindings();
 	pkvm_spin_unlock(&vm->lock);
 
+out_busy:
+	pkvm_spin_lock(&vm->lock);
+	vm->mmio_metadata_busy = false;
+	pkvm_spin_unlock(&vm->lock);
 out_unlock:
 	pkvm_spin_unlock(&ptdev->lock);
 	if (!ret)
@@ -649,15 +649,25 @@ static int pkvm_restore_ptdev_bars_locked(struct pkvm_vm *vm,
 	u16 idx;
 	int ret;
 
+	/* Withdrawal clears published; retain whether guest mappings may exist. */
+	ptdev->guest_mmio_unmap_pending |= ptdev->guest_contract_published;
 	WRITE_ONCE(ptdev->assignment_state, PKVM_PTDEV_RESTORING);
-	pkvm_withdraw_ptdev_mmio_contract_locked(vm, ptdev);
+	ret = pkvm_withdraw_ptdev_mmio_contract_locked(vm, ptdev);
+	if (ret)
+		return ret;
 
 	ret = pkvm_iommu_pause_dev_dma(ptdev);
 	if (ret)
 		return ret;
 
+	/* Rebuild for the survivors before any BAR is returned to the host. */
+	ret = pkvm_iommu_rebuild_p2p(vm);
+	if (ret)
+		return ret;
+
 	/* Revoke guest CPU access before returning any BAR range to the host. */
-	for (idx = 0; idx < ptdev->mmio_metadata.nr_ranges; idx++) {
+	for (idx = 0; ptdev->guest_mmio_unmap_pending &&
+	     idx < ptdev->mmio_metadata.nr_ranges; idx++) {
 		const struct kvm_protected_vm_ptdev_mmio_range *range =
 			&ptdev->mmio_metadata.ranges[idx];
 		u64 hpa;
@@ -673,13 +683,14 @@ static int pkvm_restore_ptdev_bars_locked(struct pkvm_vm *vm,
 		if (ret)
 			return ret;
 	}
+	ptdev->guest_mmio_unmap_pending = false;
 
 	ret = pkvm_restore_ptdev_mmio_ranges_locked(ptdev);
 	if (ret)
 		return ret;
 
 	ptdev->owner = PKVM_PTDEV_OWNER_HOST;
-	ptdev->assignment_state = PKVM_PTDEV_DETACHED;
+	/* Remain excluded from binding authorization until unlink/rollback ends. */
 	return 0;
 }
 
@@ -706,14 +717,18 @@ int pkvm_attach_ptdev(u16 bdf, struct pkvm_vm *vm)
 		goto out_put;
 	}
 
-	ret = pkvm_iommu_attach_ptdev_locked(ptdev, vm_handle);
-	if (ret) {
-		pkvm_err("%s: pkvm_iommu_attach_ptdev_locked failed bdf=0x%x ret=%d\n",
-			 __func__, bdf, ret);
-		goto out_put;
-	}
-
 	pkvm_spin_lock(&vm->lock);
+	if (vm->mmio_metadata_busy) {
+		ret = -EBUSY;
+		goto unlock_vm;
+	}
+	/* Hot-add must withdraw the live contract before changing membership. */
+	ret = pkvm_iommu_unmap_p2p(vm);
+	if (ret)
+		goto unlock_vm;
+	ret = pkvm_iommu_attach_ptdev_locked(ptdev, vm_handle);
+	if (ret)
+		goto unlock_vm;
 	ptdev->vm_handle = vm_handle;
 	ptdev->assignment_state = PKVM_PTDEV_ATTACHING;
 	list_add_tail(&ptdev->vm_node, &vm->ptdev_head);
@@ -721,6 +736,8 @@ int pkvm_attach_ptdev(u16 bdf, struct pkvm_vm *vm)
 	pkvm_spin_unlock(&ptdev->lock);
 	return 0;
 
+unlock_vm:
+	pkvm_spin_unlock(&vm->lock);
 out_put:
 	pkvm_spin_unlock(&ptdev->lock);
 	pkvm_put_ptdev(ptdev);
@@ -796,25 +813,31 @@ int pkvm_remove_ptdev(u16 bdf, struct pkvm_vm *vm)
 	return ret;
 }
 
-void pkvm_vm_destroy_ptdevs(struct pkvm_vm *vm)
+int pkvm_vm_destroy_ptdevs(struct pkvm_vm *vm)
 {
 	struct pkvm_ptdev *ptdev, *tmp;
+	int ret;
 
 	pkvm_spin_lock(&vm->lock);
+	vm->ptdev_teardown = true;
 	list_for_each_entry_safe(ptdev, tmp, &vm->ptdev_head, vm_node) {
 		if (!atomic_inc_not_zero(&ptdev->refcount)) {
 			pkvm_err("pkvm: destroy_ptdevs: ptdev bdf=0x%x refcount already zero\n",
 				 ptdev->bdf);
-			continue;
+			pkvm_spin_unlock(&vm->lock);
+			return -EIO;
 		}
 		pkvm_spin_unlock(&vm->lock);
 
-		pkvm_detach_ptdev(ptdev, vm);
+		ret = pkvm_detach_ptdev(ptdev, vm);
 		pkvm_put_ptdev(ptdev);
+		if (ret)
+			return ret;
 
 		pkvm_spin_lock(&vm->lock);
 	}
 	pkvm_spin_unlock(&vm->lock);
+	return 0;
 }
 
 static int pkvm_validate_ptdev_mmio_metadata_locked(
@@ -877,17 +900,20 @@ static int pkvm_publish_ptdev_mmio_contract_locked(struct pkvm_vm *vm,
 	if (!pkvm_ptdev_allows_guest_bar_mapping_locked(ptdev))
 		return -EAGAIN;
 
-	ret = pkvm_iommu_resume_dev_dma(ptdev,
-					vm->kvm.arch.pkvm.handle);
-	if (ret)
-		return ret;
-
 	ret = pkvm_add_vm_mmio_allowlist(vm, ptdev);
+	if (!ret) {
+		/* Include the new ranges while DMA is still paused. */
+		ptdev->guest_contract_published = true;
+		ret = pkvm_iommu_rebuild_p2p(vm);
+	}
+	if (!ret)
+		ret = pkvm_iommu_resume_dev_dma(ptdev,
+						vm->kvm.arch.pkvm.handle);
 	if (ret) {
 		pkvm_err("pkvm: MMIO contract rejected vm=%d bdf=0x%x ranges=%u ret=%d\n",
 			 vm->kvm.arch.pkvm.handle, ptdev->bdf,
 			 ptdev->mmio_metadata.nr_ranges, ret);
-		/* Keep other devices' contracts intact, including on failure. */
+		/* Withdraw partial maps, then rebuild only the surviving devices. */
 		restore_ret = pkvm_restore_ptdev_bars_locked(vm, ptdev);
 		if (restore_ret) {
 			pkvm_err("pkvm: MMIO publish rollback failed bdf=0x%x ret=%d\n",
@@ -909,14 +935,16 @@ static int pkvm_publish_ptdev_mmio_contract_locked(struct pkvm_vm *vm,
 	return 0;
 }
 
-static void pkvm_withdraw_ptdev_mmio_contract_locked(struct pkvm_vm *vm,
+static int pkvm_withdraw_ptdev_mmio_contract_locked(struct pkvm_vm *vm,
 						     struct pkvm_ptdev *ptdev)
 {
-	if (!ptdev->guest_contract_published)
-		return;
+	int ret;
 
-	pkvm_remove_vm_mmio_allowlist(vm, ptdev->bdf);
-	ptdev->guest_contract_published = false;
+	/* Source-only devices also require checked withdrawal of the old P2P map. */
+	ret = pkvm_remove_vm_mmio_allowlist(vm, ptdev->bdf);
+	if (!ret)
+		ptdev->guest_contract_published = false;
+	return ret;
 }
 
 int pkvm_set_ptdev_mmio_metadata(struct pkvm_vm *vm,
@@ -944,7 +972,7 @@ int pkvm_set_ptdev_mmio_metadata(struct pkvm_vm *vm,
 		goto out;
 	}
 	pkvm_spin_lock(&vm->lock);
-	if (vm->kvm.arch.pkvm.finalized || vm->mmio_metadata_busy) {
+	if (vm->mmio_metadata_busy) {
 		ret = -EBUSY;
 	} else {
 		vm->mmio_metadata_busy = true;
@@ -967,7 +995,7 @@ int pkvm_set_ptdev_mmio_metadata(struct pkvm_vm *vm,
 		ptdev->mmio_metadata = *metadata;
 		ptdev->mmio_metadata_valid = true;
 		ret = pkvm_publish_ptdev_mmio_contract_locked(vm, ptdev);
-		if (ret == -EAGAIN) {
+		if (ret == -EAGAIN && !vm->kvm.arch.pkvm.finalized) {
 			ret = 0;
 		} else if (ret && !ptdev->touched_mmio_range_count) {
 			ptdev->mmio_metadata_valid = false;
@@ -979,7 +1007,7 @@ int pkvm_set_ptdev_mmio_metadata(struct pkvm_vm *vm,
 
 	ret = pkvm_ptdev_mmio_metadata_equal(&ptdev->mmio_metadata, metadata) ?
 	      pkvm_publish_ptdev_mmio_contract_locked(vm, ptdev) : -EBUSY;
-	if (ret == -EAGAIN) {
+	if (ret == -EAGAIN && !vm->kvm.arch.pkvm.finalized) {
 		ret = 0;
 	} else if (ret && ret != -EBUSY && !ptdev->touched_mmio_range_count) {
 		ptdev->mmio_metadata_valid = false;
@@ -1011,16 +1039,21 @@ int pkvm_get_ptdev_mmio_info(struct pkvm_vm *vm,
 }
 
 int pkvm_read_ptdev_mmio_allow_ranges(struct pkvm_vm *vm, u16 start,
-				      u16 nr_ranges,
+				      u16 nr_ranges, u16 generation,
 				      struct pkvm_guest_mmio_allow_range *ranges)
 {
 	int ret = 0;
 
-	if (!vm || !ranges || !nr_ranges)
+	if (!vm || !ranges)
 		return -EINVAL;
 
 	pkvm_spin_lock(&vm->lock);
-	if (start >= vm->mmio_allow_nr_ranges ||
+	/* Check before bounds: a concurrent removal may have shrunk the list. */
+	if (generation != vm->mmio_allow_generation) {
+		ret = -EAGAIN;
+		goto out;
+	}
+	if (start > vm->mmio_allow_nr_ranges ||
 	    nr_ranges > vm->mmio_allow_nr_ranges - start) {
 		ret = -EINVAL;
 		goto out;
@@ -1112,19 +1145,23 @@ int pkvm_handle_ptdev_mmio_info(struct kvm_vcpu *vcpu, gpa_t guest_gpa,
 }
 
 int pkvm_handle_ptdev_mmio_read(struct kvm_vcpu *vcpu, gpa_t guest_gpa,
-				u16 nr_ranges, u16 start)
+				u16 nr_ranges, u16 start,
+				unsigned long generation)
 {
 	struct pkvm_vm *vm = to_pkvm(vcpu->kvm);
 	struct pkvm_guest_mmio_allow_range
 		ranges[PKVM_GUEST_MMIO_ALLOW_MAX_RANGES];
 	int ret;
 
-	if (!guest_gpa || !nr_ranges || nr_ranges > ARRAY_SIZE(ranges))
+	if (!guest_gpa || nr_ranges > ARRAY_SIZE(ranges) || generation > U16_MAX)
 		return -KVM_EINVAL;
 
-	ret = pkvm_read_ptdev_mmio_allow_ranges(vm, start, nr_ranges, ranges);
+	ret = pkvm_read_ptdev_mmio_allow_ranges(vm, start, nr_ranges,
+					      generation, ranges);
 	if (ret)
 		return ret;
+	if (!nr_ranges)
+		return 0;
 
 	ret = pkvm_write_guest_gpa(vcpu, guest_gpa, ranges,
 				   nr_ranges * sizeof(ranges[0]));
